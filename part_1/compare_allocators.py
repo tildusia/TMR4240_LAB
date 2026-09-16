@@ -102,7 +102,7 @@ def main():
     # Scaled up from the original values so that "surge"/"sway"/"yaw"/"combined"
     # actually saturate at least one thruster and trigger SLSQP in `improved`.
     # If "SLSQP used" shows False for a case, that demand is still within the
-    # pseudo-inverse baseline's capacity -- scale it up further.
+    # pseudo-inverse baseline's capacity
     test_cases = {
         "surge":    np.array([200000, 0, 0, 0, 0, 0]),
         "sway":     np.array([0, 200000, 0, 0, 0, 0]),
