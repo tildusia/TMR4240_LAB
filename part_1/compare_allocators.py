@@ -15,7 +15,7 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 
-from part_1.thrust_allocation import ThrustAllocator, ThrustAllocatorSLSQP
+from part_1.thrust_allocation import ThrustAllocator, ThrustAllocatorBaseline
 from part_1.config import default_thrusters_gunnerus3
 
 
@@ -94,8 +94,8 @@ def compare_on_test_cases(baseline, improved, test_cases):
 
 def main():
     thrusters = default_thrusters_gunnerus3()
-    baseline = ThrustAllocator(thrusters)
-    improved = ThrustAllocatorSLSQP(thrusters)
+    baseline = ThrustAllocatorBaseline(thrusters)
+    improved = ThrustAllocator(thrusters)
 
     plot_capacity_envelope(baseline, improved, out_path="figures/capacity_polar.png")
 

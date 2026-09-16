@@ -1,10 +1,10 @@
 import numpy as np
 from part_1.config import default_thrusters_gunnerus3
-from part_1.thrust_allocation import ThrustAllocator
+from part_1.thrust_allocation import ThrustAllocator, ThrustAllocatorBaseline
 
 
 def test_build_Be_matches_hand_calculation():
-    ta = ThrustAllocator(default_thrusters_gunnerus3())
+    ta = ThrustAllocatorBaseline(default_thrusters_gunnerus3())
 
     expected = np.array([
         [0,1,0,1,0],
@@ -16,9 +16,8 @@ def test_build_Be_matches_hand_calculation():
     assert np.allclose(ta.Be, expected)
 
 def test_allocation_slsqp_isolated_wrenches():
-    """Mirrors simulation/checks.py::check_allocation, but for ThrustAllocatorSLSQP."""
+    """Mirrors simulation/checks.py::check_allocation, for the SLSQP-based ThrustAllocator."""
     from models.thruster_dynamics import ThrusterSet
-    from part_1.thrust_allocation import ThrustAllocatorSLSQP
 
     cfgs = default_thrusters_gunnerus3()
     cases = [
@@ -28,7 +27,7 @@ def test_allocation_slsqp_isolated_wrenches():
         ("combined 10 kN / 10 kN / 100 kNm", np.array([10e3, 10e3, 0, 0, 0, 100e3])),
     ]
 
-    allocator = ThrustAllocatorSLSQP(cfgs)
+    allocator = ThrustAllocator(cfgs)
     for label, tau_d in cases:
         ts = ThrusterSet(cfgs, dynamics=False)
         u_cmd, a_cmd = allocator.allocate(
