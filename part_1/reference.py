@@ -72,7 +72,7 @@ class ReferenceModel:
         # 1
         wn, zeta = cfg.wn, cfg.zeta
         # 2
-        acc = wn**2 * (sp-pos) - 2 * zeta * vel
+        acc = wn**2 * (sp-pos) - 2 * zeta * wn * vel
         # 3
         vel_new = vel + acc * dt
         if cfg.rate_limit is not None:
@@ -83,7 +83,32 @@ class ReferenceModel:
     def step(
         self, t: float, dt: float, eta_cmd: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        # TODO: Replace this pass-through placeholder with your reference model.
+
+        """
+        Advance the reference filter one time step.
+
+        Runs the second-order filter (filter_axis) independently on each of
+        the three controlled axes (N, E, psi), and packs the results into
+        6-DOF NED-frame vectors.
+
+        The heading (psi) is handled specially: the commanded setpoint is
+        unwrapped relative to the filter's own current state before
+        filtering (so the filter always takes the shortest path and never
+        jumps by 2*pi), and the result is wrapped back to (-pi, pi] after
+        filtering.
+
+         Args:   
+            t       : current simulation time [s] (unused, kept for interface
+                    consistency with the other Part 1 modules)    
+            dt      : time step [s]
+            eta_cmd : (6,) raw, unfiltered commanded setpoint in NED
+                    (N_cmd = eta_cmd[0], E_cmd = eta_cmd[1], psi_cmd = eta_cmd[5])
+
+        Returns:
+            eta_ref : (6,) filtered reference position/heading, NED
+            nu_ref  : (6,) filtered reference velocity, NED
+            acc_ref : (6,) filtered reference acceleration, NED
+        """
         eta_cmd = np.asarray(eta_cmd, dtype=float).reshape(6)
 
         # N (north / surge direction in NED)
@@ -104,10 +129,10 @@ class ReferenceModel:
         # Unwap the commanded heading relative to the filters own
         # current state before fitlering to avoid the filter
         # chasing the long way / jumping by 2pi when sp is near +- pi.
-        psi_sp_unwrapped = self.eta_ref[5] + wrap_angle_pi(eta_cmd[5] - self-self.eta_ref[5])
+        psi_sp_unwrapped = self.eta_ref[5] + wrap_angle_pi(eta_cmd[5] - self.eta_ref[5])
         psi_new, psidot_new, psiddot = self.filter_axis(self.eta_ref[5],
                                                         self.nu_ref[5], 
-                                                        psi_sp_unwrapped[5], 
+                                                        psi_sp_unwrapped, 
                                                         self.cfg_psi, 
                                                         dt)
         psi_new = wrap_angle_pi(psi_new)
