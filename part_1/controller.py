@@ -73,9 +73,9 @@ class DPController:
 
     def __init__(
         self,
-        Kp: np.ndarray = np.array([384_465.0, 452_318.0, 34_916_622.0]),   # surge, sway, yaw
-        Ki: np.ndarray = np.array([30_757.0, 36_185.0, 2_793_330.0]),
-        Kd: np.ndarray = np.array([961_163.0, 1_130_795.0, 87_291_555.0]),
+        Kp: np.ndarray = np.array([24_028.00, 28_268.00, 545_600.00]),  # surge, sway, yaw
+        Ki: np.ndarray = np.array([480.56, 565.36, 5_456.00]),
+        Kd: np.ndarray = np.array([240_280.00, 282_680.00, 10_912_000.00]),
         Kaw: np.ndarray = np.array([0.2, 0.2, 0.2]),
         use_feedforward: bool = True,
     ):
