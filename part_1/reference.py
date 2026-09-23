@@ -48,8 +48,8 @@ class ReferenceModel:
         cfg_psi: RefAxisConfig | None = None,
     ):
         self.dt = float(dt)
-        self.cfg_xy = cfg_xy if cfg_xy is not None else RefAxisConfig()
-        self.cfg_psi = cfg_psi if cfg_psi is not None else RefAxisConfig()
+        self.cfg_xy = cfg_xy if cfg_xy is not None else RefAxisConfig(wn=0.15, zeta=1.0)
+        self.cfg_psi = cfg_psi if cfg_psi is not None else RefAxisConfig(wn=0.08, zeta=1.0)
         self.eta_ref = np.zeros(6)
         self.nu_ref = np.zeros(6)
         self.acc_ref = np.zeros(6)
