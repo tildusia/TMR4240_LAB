@@ -25,8 +25,17 @@ from part_1.wind import Wind
 
 
 def main():
+    # hold = 300.0  # [s] per hjørne — låst av spesifikasjonen, ikke et valg
+
+    # corners = [
+    #     [50.0,   0.0,  0.0],
+    #     [50.0, -50.0,  0.0],
+    #     [50.0, -50.0, -np.pi / 4],
+    #     [ 0.0, -50.0, -np.pi / 4],
+    #     [ 0.0,   0.0,  0.0],
+    # ]
     # 1) Simulation clock and options
-    cfg = SimConfig(dt=0.05, T=300.0, method="Euler", use_reference=True)
+    cfg = SimConfig(dt=0.05, T=500, method="Euler", use_reference=False)
 
     # 2) Controller, reference model, and thruster layout
     # Pass your own design parameters (gains, limits, ...) to your controller.
@@ -48,13 +57,25 @@ def main():
     # The 3-DOF model uses N = eta_cmd[0], E = eta_cmd[1], psi = eta_cmd[5];
     # leave the other components zero.
     # Constant setpoint example:
-    eta_cmd = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 
+    # n_steps = round(cfg.T / cfg.dt) + 1
+    # per_leg = int(round(hold / cfg.dt))
+    # eta_cmd = np.zeros((n_steps, 6))
+
+    eta_cmd = np.array([10.0, 10.0, 0.0, 0.0, 0.0, 3 *np.pi / 2])
     # Students may replace eta_cmd with a time series of shape (N_steps, 6).
+
+    # for i, c in enumerate(corners):
+    #     start = i * per_leg
+    #     end = n_steps if i == len(corners) - 1 else (i + 1) * per_leg
+    #     eta_cmd[start:end, 0] = c[0]   # N
+    #     eta_cmd[start:end, 1] = c[1]   # E
+    #     eta_cmd[start:end, 5] = c[2]   # psi
 
     # 5) Define environment models (default: calm water)
     current = Current()
     wind = Wind()
+
 
     # Simulation 1a from the project description — station keeping at the
     # origin in a 0.5 m/s current from east, no wind. Once your subsystems
