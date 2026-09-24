@@ -35,7 +35,7 @@ def main():
         [ 0.0,   0.0,  0.0],
     ]
     # 1) Simulation clock and options
-    cfg = SimConfig(dt=0.05, T=800, method="Euler", use_reference=True)
+    cfg = SimConfig(dt=0.05, T=hold*len(corners), method="Euler", use_reference=True)
 
     # 2) Controller, reference model, and thruster layout
     # Pass your own design parameters (gains, limits, ...) to your controller.
@@ -86,6 +86,20 @@ def main():
     # 6) Run simulation
     sim.reset_state()
     logs = sim.run(eta_cmd, current=current, wind=wind)
+
+    print("Fraction of samples at/near saturation:")
+    limits_kN = {"Tunnel_Bow": 32.0, "Azimuth_1": 80.0, "Azimuth_2": 80.0}
+    for i, name in enumerate(logs.thruster_names):
+        u_kN = np.abs(logs.u[:, i]) / 1000.0
+        frac_sat = np.mean(u_kN >= 0.99 * limits_kN[name])
+        print(f"  {name}: saturated {frac_sat*100:.1f}% of the run "
+            f"(peak {u_kN.max():.1f} kN of {limits_kN[name]} kN)")
+
+    print("\nPeak |controller wrench| (before allocation):")
+    print(f"  Fx: {np.max(np.abs(logs.tau_d[:,0]))/1000:.1f} kN")
+    print(f"  Fy: {np.max(np.abs(logs.tau_d[:,1]))/1000:.1f} kN")
+    print(f"  Mz: {np.max(np.abs(logs.tau_d[:,5]))/1000:.1f} kNm")
+
 
     # 7) Plot results
     # See simulation/plotter.py for more: plot_xy, plot_thrusters,
