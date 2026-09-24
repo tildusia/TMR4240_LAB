@@ -231,9 +231,9 @@ class DPController:
         is applied to.
         """
         tau_applied = np.asarray(tau_applied, dtype=float).reshape(6)
-        diff_xy_ned = tau_applied[:2] - self._tau_unsat[:2]   # still BODY here...
+        diff_xy_ned = tau_applied[:2] - self._tau_unsat[:2] - self._tau_unsat[:2]   # still BODY here...
         # tau is in BODY; integrator states int_ned are in NED, so rotate
         # the correction from BODY back to NED before applying it.
         diff_ned = body_to_ned_xy(diff_xy_ned, psi)
-        self.int_ned += self.Kaw[:2] * diff_ned * dt
-        self.int_psi += self.Kaw[2] * (tau_applied[5] - self._tau_unsat[5]) * dt
+        self.int_ned += self.Kaw[:2] * diff_ned * dt / self.Ki[:2]
+        self.int_psi += self.Kaw[2] * (tau_applied[5] - self._tau_unsat[5]) * dt / self.Ki[2]
