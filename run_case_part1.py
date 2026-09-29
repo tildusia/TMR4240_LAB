@@ -37,8 +37,8 @@ def main():
     #     [ 0.0,   0.0,  0.0],
     # ]
     # 1) Simulation clock and options
-    # 1a and 1b : T=800, 2 T=300, 3 T=300 4 T=hold*len(corners)
-    cfg = SimConfig(dt=0.05, T=300, method="Euler", use_reference=True)
+    # 1a and 1b : T=800, 2 T=600, 3 T=300 4 T=hold*len(corners)
+    cfg = SimConfig(dt=0.05, T=600, method="Euler", use_reference=False)
 
     # 2) Controller, reference model, and thruster layout
     # Pass your own design parameters (gains, limits, ...) to your controller.
@@ -65,7 +65,7 @@ def main():
     # per_leg = int(round(hold / cfg.dt))
     # eta_cmd = np.zeros((n_steps, 6))
 
-    eta_cmd = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    eta_cmd = np.array([10.0, 10.0, 0.0, 0.0, 0.0, 3*np.pi/2])
     # Students may replace eta_cmd with a time series of shape (N_steps, 6).
 
     # for i, c in enumerate(corners):
@@ -76,7 +76,7 @@ def main():
     #     eta_cmd[start:end, 5] = c[2]   # psi
 
     # 5) Define environment models (default: calm water)
-    current = Current(0.5, 0.0, semantics="from", beta_end=np.pi / 2, duration=300.0)
+    current = Current()
     wind = Wind()
 
 
