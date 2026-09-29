@@ -37,7 +37,7 @@ def main():
     #     [ 0.0,   0.0,  0.0],
     # ]
     # 1) Simulation clock and options
-    # 1a and 1b : T=800, 2 T=600, 3 T=300 4 T=hold*len(corners)
+    # 1a and 1b : T=800, 2 T=800, 3 T=600 4 T=hold*len(corners)
     cfg = SimConfig(dt=0.05, T=600, method="Euler", use_reference=False)
 
     # 2) Controller, reference model, and thruster layout
