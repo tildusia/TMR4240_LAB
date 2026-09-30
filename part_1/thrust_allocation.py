@@ -103,7 +103,7 @@ class ThrustAllocatorBaseline: #given different name to avoid confusion with the
             elif thr.kind == "azimuth":
                 Fx, Fy = z[col], z[col + 1]
                 u_cmd[i] = np.hypot(Fx, Fy)
-                alpha_cmd[i] = np.atan2(Fy, Fx)
+                alpha_cmd[i] = np.arctan2(Fy, Fx)
                 col += 2
 
         return u_cmd, alpha_cmd

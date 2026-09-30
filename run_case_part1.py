@@ -25,7 +25,7 @@ from part_1.wind import Wind
 
 
 def main():
-    hold = 300.0  # [s] per hjørne — låst av spesifikasjonen, ikke et valg
+    hold = 700.0  # [s] per hjørne — låst av spesifikasjonen, ikke et valg
 
     corners = [
         [50.0,   0.0,  0.0],
@@ -73,15 +73,17 @@ def main():
         eta_cmd[start:end, 5] = c[2]   # psi
 
     # 5) Define environment models (default: calm water)
-    current = Current()
-    wind = Wind()
+    #current = Current()
+    #wind = Wind()
 
 
     # Simulation 1a from the project description — station keeping at the
     # origin in a 0.5 m/s current from east, no wind. Once your subsystems
     # are implemented, uncomment these two lines (and set T=800.0 above):
-    # current = Current(0.5, np.pi / 2, semantics="from")
-    # wind = Wind()
+
+    current = Current(0.5, np.pi / 2, semantics="from")
+    wind = Wind()
+    #wind = Wind(mean_speed=15, beta= np.pi/2, semantics="from", sigma_slow= 1)
 
     # 6) Run simulation
     sim.reset_state()
