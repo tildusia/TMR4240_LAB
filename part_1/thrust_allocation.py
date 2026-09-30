@@ -35,8 +35,10 @@ from scipy.optimize import minimize
 
 #First itteration of thrust allocation, using pseudo-inverse to find the z-vector, and then scaling it down if any of the thrusters exceed their maximum thrust. This is a simple and effective method, but it does not take into account the dynamics of the thrusters or the power consumption. It also does not guarantee that the solution is optimal in any sense.
 #Time invariant thrust allocation for a set of thrusters.
-class ThrustAllocatorBaseline: #given different name to avoid confusion with the improved ThrustAllocator, when simulations are called
+#given different name to avoid confusion with the improved ThrustAllocator, when simulations are called
+#This code is not used, but included here to show the evolution of the thrust allocation algorithm, and to provide a baseline for comparison with the improved ThrustAllocator.
 
+class ThrustAllocatorBaseline: 
     def __init__(self, thrusters: List[ThrusterConfig]):
         self.thrusters = thrusters
         self.Be = self._build_Be()
