@@ -20,6 +20,8 @@ from part_1.controller import DPController
 from part_1.reference import ReferenceModel
 from part_1.current import Current
 from part_1.wind import Wind
+from simulation.plotter import plot_wind
+
 
 
 
@@ -27,15 +29,16 @@ from part_1.wind import Wind
 def main():
     hold = 700.0  # [s] per hjørne — låst av spesifikasjonen, ikke et valg
 
-    corners = [
-        [50.0,   0.0,  0.0],
-        [50.0, -50.0,  0.0],
-        [50.0, -50.0, -np.pi / 4],
-        [ 0.0, -50.0, -np.pi / 4],
-        [ 0.0,   0.0,  0.0],
-    ]
+    # corners = [
+    #     [50.0,   0.0,  0.0],
+    #     [50.0, -50.0,  0.0],
+    #     [50.0, -50.0, -np.pi / 4],
+    #     [ 0.0, -50.0, -np.pi / 4],
+    #     [ 0.0,   0.0,  0.0],
+    # ]
     # 1) Simulation clock and options
-    cfg = SimConfig(dt=0.05, T=hold*len(corners), method="Euler", use_reference=True)
+    # 1a and 1b : T=800, 2 T=800, 3 T=600 4 T=hold*len(corners)
+    cfg = SimConfig(dt=0.05, T=800.0, method="Euler", use_reference=True)
 
     # 2) Controller, reference model, and thruster layout
     # Pass your own design parameters (gains, limits, ...) to your controller.
@@ -58,19 +61,19 @@ def main():
     # leave the other components zero.
     # Constant setpoint example:
 
-    n_steps = round(cfg.T / cfg.dt) + 1
-    per_leg = int(round(hold / cfg.dt))
-    eta_cmd = np.zeros((n_steps, 6))
+    # n_steps = round(cfg.T / cfg.dt) + 1
+    # per_leg = int(round(hold / cfg.dt))
+    # eta_cmd = np.zeros((n_steps, 6))
 
-    # eta_cmd = np.array([10.0, 10.0, 0.0, 0.0, 0.0, 3 *np.pi / 2])
+    eta_cmd = np.zeros(6)
     # Students may replace eta_cmd with a time series of shape (N_steps, 6).
 
-    for i, c in enumerate(corners):
-        start = i * per_leg
-        end = n_steps if i == len(corners) - 1 else (i + 1) * per_leg
-        eta_cmd[start:end, 0] = c[0]   # N
-        eta_cmd[start:end, 1] = c[1]   # E
-        eta_cmd[start:end, 5] = c[2]   # psi
+    # for i, c in enumerate(corners):
+    #     start = i * per_leg
+    #     end = n_steps if i == len(corners) - 1 else (i + 1) * per_leg
+    #     eta_cmd[start:end, 0] = c[0]   # N
+    #     eta_cmd[start:end, 1] = c[1]   # E
+    #     eta_cmd[start:end, 5] = c[2]   # psi
 
     # 5) Define environment models (default: calm water)
     #current = Current()
@@ -81,8 +84,9 @@ def main():
     # origin in a 0.5 m/s current from east, no wind. Once your subsystems
     # are implemented, uncomment these two lines (and set T=800.0 above):
 
-    current = Current(0.5, np.pi / 2, semantics="from")
-    wind = Wind()
+    current = Current()
+    wind = Wind(15.0, np.pi / 2, semantics="from",
+                sigma_slow=1.0, seed=42)
     #wind = Wind(mean_speed=15, beta= np.pi/2, semantics="from", sigma_slow= 1)
 
     # 6) Run simulation
@@ -108,6 +112,7 @@ def main():
     # plot_wrench, plot_current, plot_wind.
     plot_dashboard(logs)
     plot_time_histories(logs)
+    plot_wind(logs)
     plt.show()
 
     # Confirmation
