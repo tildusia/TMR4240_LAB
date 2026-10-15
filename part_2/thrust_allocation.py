@@ -76,21 +76,26 @@ def build_Be(thrusters: List[ThrusterConfig]) -> np.ndarray:
        
     return Be
 
-def build_rotation_penalty(thrusters, alpha_now, q) -> np.ndarray:
+def build_rotation_penalty(thrusters, alpha_now, u_now, q, u_floor_frac=0.05) -> np.ndarray:
+
+    # Penalty on the change in azimuth angle, linearised around the current state.
+    # Wanted cost per azimuth: q * u_max^2 * dalpha^2.
+    # With e_perp across the current direction, e_perp^T z_i = |z_i| sin(dalpha) ~ u_now * dalpha,
+    # so dalpha ~ e_perp^T z_i / u_now, which is linear in z and keeps the problem quadratic.
+    # u_eff has a floor so the scale stays finite when the thruster is (almost) idle.
 
     n_z = sum(2 if th.kind == "azimuth" else 1 for th in thrusters)
     Rp = np.zeros((n_z, n_z))
     col = 0
 
-    if alpha_now is None:
-        return Rp
     for i, thr in enumerate(thrusters):
-        alpha_now_i = alpha_now[i]
         if thr.kind == "tunnel":
             col += 1
         elif thr.kind == "azimuth":
-            e = np.array([-np.sin(alpha_now_i), np.cos(alpha_now_i)])
-            Rp[col:col + 2, col:col + 2] = q * np.outer(e, e)
+            e = np.array([-np.sin(alpha_now[i]), np.cos(alpha_now[i])])
+            u_eff = max(abs(u_now[i]), u_floor_frac * thr.u_max)
+            scale = (thr.u_max / u_eff) ** 2
+            Rp[col:col + 2, col:col + 2] = q * scale * np.outer(e, e)
             col += 2
 
     return Rp
@@ -202,9 +207,11 @@ class ThrustAllocator:
 
     Regime 1 (feasible demand): weighted minimum-norm solution
         min z^T H z  s.t.  Be z = tau,   H = I + P(alpha_now),
-    solved in closed form by weighted_pinv_solve. P penalises force across
-    each azimuth's current direction, so the thrusters prefer to push along
-    where they already point. Used whenever all thrusters stay within u_max.
+    solved in closed form by weighted_pinv_solve. P penalises the change in
+    azimuth angle, linearised around the current state, so that
+    z_i^T P_i z_i ~ q u_max,i^2 dalpha_i^2. This keeps the allocator from
+    chasing high-frequency demand content (azimuth hunting). Used whenever
+    all thrusters stay within u_max.
 
     Regime 2 (infeasible demand): SLSQP on the augmented vector [z, lambda],
         min -lambda + mu z^T P z
@@ -216,18 +223,17 @@ class ThrustAllocator:
     and falls back to that scaled solution if SLSQP fails.
 
     q sets the strength of the rotation penalty (q = 0 gives the plain
-    pseudo-inverse). mu is derived from q and the azimuth u_max values.
+    pseudo-inverse). u_floor_frac sets the lowest thrust, as a fraction of
+    u_max, used in the linearisation. mu is recomputed every call from the
+    current P so the penalty costs at most about 1e-3 in lambda.
     """
 
-    def __init__(self, thrusters: List[ThrusterConfig], q: float = 0.1):
+    def __init__(self, thrusters: List[ThrusterConfig], q: float = 1.0, u_floor_frac: float = 0.05):
         self.thrusters = thrusters
         self.Be = build_Be(thrusters)  #Constant 3 x n_z effectiveness matrix, built by build_Be()
 
-        self.q = q
-        if self.q == 0.0:
-            self.mu = 0.0
-        else:
-            self.mu = 1e-3 / (self.q * sum((thr.u_max/1000)**2 for thr in self.thrusters if thr.kind == "azimuth"))  # weight for the rotation penalty, scaled to kN^2
+        self.q = q  # rotation penalty weight, dimensionless (cost of q * u_max^2 * dalpha^2)
+        self.u_floor_frac = u_floor_frac  # floor on |u_now| in the linearisation, fraction of u_max
 
         self.n_calls = 0  #counter
         self.n_triggered = 0  #counter
@@ -247,8 +253,21 @@ class ThrustAllocator:
     
         tau = np.asarray(tau_d, dtype=float)[[0, 1, 5]]
         n_z = self.Be.shape[1]
-        Rp = build_rotation_penalty(self.thrusters, alpha_now, self.q)
+        Rp = build_rotation_penalty(self.thrusters, alpha_now, u_now, self.q, self.u_floor_frac)
         H = np.eye(n_z) + Rp
+
+        # mu for the SLSQP objective, from the derived bound
+        #   lambda* - lambda_mu <= mu * sum_i lambda_max(P_i) * u_max,i^2   (u_max in kN)
+        # Each azimuth block is rank 1, so its largest eigenvalue is its trace.
+        bound = 0.0
+        col = 0
+        for thr in self.thrusters:
+            if thr.kind == "tunnel":
+                col += 1
+            elif thr.kind == "azimuth":
+                bound += np.trace(Rp[col:col + 2, col:col + 2]) * (thr.u_max / 1000) ** 2
+                col += 2
+        mu = 1e-3 / bound if bound > 0.0 else 0.0
 
         z = weighted_pinv_solve(self.Be, H, tau)
 
@@ -270,7 +289,7 @@ class ThrustAllocator:
 
             def objective(z_bar):
                 lam = z_bar[-1]  # Retrieves the lambda variable, can not use 1/lambda because of possible divison by 0
-                return -lam + self.mu * z_bar[:-1].T @ Rp @ z_bar[:-1] # maximize lambda, small penalty on force across current azimuth direction
+                return -lam + mu * z_bar[:-1] @ Rp @ z_bar[:-1]  # maximize lambda, small penalty on azimuth rotation as tie-breaker
 
             def equality(z_bar):
                 lam = z_bar[-1]

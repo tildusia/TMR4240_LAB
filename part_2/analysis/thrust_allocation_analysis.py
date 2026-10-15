@@ -8,12 +8,21 @@ state is fed back as u_now / alpha_now. This isolates the effect of q on the
 allocator itself.
 
 Run from the repo root (TMR4240_LAB):
-    python -m part_2.studies.thrust_allocation_analysis
-    python -m part_2.studies.thrust_allocation_analysis --scenario steps --show
+    python -m part_2.analysis.thrust_allocation_analysis
+    python -m part_2.analysis.thrust_allocation_analysis --scenario noisy --show
+
+Scenarios
+---------
+rotating   : constant force turning slowly through 360 deg (necessary rotation)
+steps      : constant force jumping between directions (necessary rotation)
+noisy      : constant mean force plus wave-like oscillations. After the warm-up
+             the mean needs no rotation, so all measured rotation is unnecessary
+             (azimuth hunting). This is what the rotation penalty is meant for.
+noisy_low  : as noisy, but with a low mean force, where hunting is worst
 
 Figures are written to figures/thrust_allocation_analysis/.
 
-Metrics per run
+Metrics per run (computed after the scenario's warm-up time)
 ---------------
 rotation   : total azimuth rotation, sum_k sum_i |alpha_i[k] - alpha_i[k-1]|  [deg]
 effort     : thrust effort, sum_k sum_i u_i[k]^2 * dt                          [kN^2 s]
@@ -35,8 +44,8 @@ from models.thruster_dynamics import ThrusterSet
 
 
 DT = 0.1                                     # same as run_case_part_2.py
-Q_VALUES = [0.0, 0.01, 0.1, 1.0, 10.0, 100.0]
-Q_TIMESERIES = [0.0, 1.0, 100.0]             # runs shown in the time series figure
+Q_VALUES = [0.0, 1.0, 2.0, 3.0, 5.0, 10.0]
+Q_TIMESERIES = [0.0, 3.0, 10.0]
 OUT_DIR = Path("figures") / "thrust_allocation_analysis"
 
 
@@ -63,9 +72,41 @@ def scenario_steps(t):
     return np.array([F_DEMAND * np.cos(phi), F_DEMAND * np.sin(phi), 0.0, 0.0, 0.0, 0.0])
 
 
+# Wave-like content: two sinusoids per DOF with periods in the wave band (5-12 s),
+# so the demand direction wobbles around a constant mean.
+NOISY_DIR_DEG = 30.0  # direction of the mean force [deg]
+NOISY_OSC = [         # (DOF index in tau_d, amplitude, period [s], phase [rad])
+    (0, 4e3, 8.0, 0.0), (0, 2e3, 5.3, 1.1),
+    (1, 4e3, 9.5, 0.7), (1, 2e3, 6.1, 2.3),
+    (5, 40e3, 11.0, 0.4), (5, 20e3, 7.2, 1.9),
+]
+NOISY_WARMUP = 60.0   # [s], time to settle on the mean before measuring
+
+
+def _noisy(t, F_mean):
+    phi = np.radians(NOISY_DIR_DEG)
+    tau = np.array([F_mean * np.cos(phi), F_mean * np.sin(phi), 0.0, 0.0, 0.0, 0.0])
+    for dof, amp, period, phase in NOISY_OSC:
+        tau[dof] += amp * np.sin(2.0 * np.pi * t / period + phase)
+    return tau
+
+
+def scenario_noisy(t):
+    """Moderate mean force (20 kN) with wave-like oscillations."""
+    return _noisy(t, 20e3)
+
+
+def scenario_noisy_low(t):
+    """Low mean force (6 kN) with the same oscillations."""
+    return _noisy(t, 6e3)
+
+
+# name: (tau_d(t), duration [s], warm-up excluded from the metrics [s])
 SCENARIOS = {
-    "rotating": (scenario_rotating, 180.0),
-    "steps": (scenario_steps, STEP_HOLD * len(STEP_DIRS_DEG)),
+    "rotating": (scenario_rotating, 180.0, 0.0),
+    "steps": (scenario_steps, STEP_HOLD * len(STEP_DIRS_DEG), 0.0),
+    "noisy": (scenario_noisy, 300.0, NOISY_WARMUP),
+    "noisy_low": (scenario_noisy_low, 300.0, NOISY_WARMUP),
 }
 
 
@@ -132,16 +173,18 @@ def _rms_moment(d):
     return np.sqrt(np.mean(d[:, 2] ** 2)) / 1e3
 
 
-def metrics(log, thrusters):
+def metrics(log, thrusters, t_skip=0.0):
     az = [i for i, th in enumerate(thrusters) if th.kind == "azimuth"]
-    dalpha = _wrap(np.diff(log["alpha"][:, az], axis=0))
+    keep = log["t"] >= t_skip
+    alpha = log["alpha"][keep][:, az]
+    dalpha = _wrap(np.diff(alpha, axis=0))
 
-    act = log["tau_alloc"] - log["tau_thr"]
-    trk = log["tau_d"] - log["tau_thr"]
+    act = (log["tau_alloc"] - log["tau_thr"])[keep]
+    trk = (log["tau_d"] - log["tau_thr"])[keep]
 
     return {
         "rotation": np.degrees(np.sum(np.abs(dalpha))),
-        "effort": np.sum(log["u"] ** 2) * DT / 1e6,
+        "effort": np.sum(log["u"][keep] ** 2) * DT / 1e6,
         "act_res_F": _rms_force(act),
         "act_res_M": _rms_moment(act),
         "track_res_F": _rms_force(trk),
@@ -201,7 +244,7 @@ def plot_timeseries(logs, thrusters, scenario):
     for q, log in logs.items():
         t = log["t"]
         for row, i in enumerate(az):
-            axes[row].plot(t, np.degrees(log["alpha"][:, i]), label=f"q={q:g}")
+            axes[row].plot(t, np.degrees(np.unwrap(log["alpha"][:, i])), label=f"q={q:g}")  # unwrap: no false 360 deg jumps at +-180
             axes[row].set_ylabel(f"alpha {thrusters[i].name} [deg]")
         axes[len(az)].plot(t, np.linalg.norm(log["u"], axis=1) / 1e3, label=f"q={q:g}")
         axes[len(az) + 1].plot(t, log["tau_thr"][:, 0] / 1e3, label=f"q={q:g}")
@@ -228,8 +271,8 @@ def plot_timeseries(logs, thrusters, scenario):
 # Main
 # -----------------------------------------------------------------------------
 
-def print_table(results, scenario):
-    print(f"\nScenario: {scenario}")
+def print_table(results, scenario, t_skip=0.0):
+    print(f"\nScenario: {scenario}" + (f"  (metrics from t = {t_skip:g} s)" if t_skip else ""))
     header = (f"{'q':>8} {'rot [deg]':>10} {'effort':>10} {'act F':>8} {'act M':>8} "
               f"{'trk F':>8} {'trk M':>8} {'SLSQP %':>8} {'fallb.':>7}")
     print(header)
@@ -242,12 +285,12 @@ def print_table(results, scenario):
 
 
 def analyse(scenario, show):
-    tau_fun, T = SCENARIOS[scenario]
+    tau_fun, T, t_skip = SCENARIOS[scenario]
     thrusters = default_thrusters_part_2()
 
     logs = {q: run(thrusters, q, tau_fun, T) for q in Q_VALUES}
-    results = {q: metrics(log, thrusters) for q, log in logs.items()}
-    print_table(results, scenario)
+    results = {q: metrics(log, thrusters, t_skip) for q, log in logs.items()}
+    print_table(results, scenario, t_skip)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     figs = {
