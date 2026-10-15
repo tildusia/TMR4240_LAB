@@ -163,6 +163,35 @@ def z_to_commands(
 
     return u_cmd, alpha_cmd
 
+def weighted_pinv_solve(Be, H, tau):
+    """
+    Weighted minimum-norm solution of Be z = tau.
+
+    Solves  min_z  z^T H z   s.t.  Be z = tau,
+    with H = I + P symmetric positive definite.
+
+    Parameters
+    ----------
+    Be  : (3, n_z) extended thrust configuration matrix
+    H   : (n_z, n_z) weighting matrix
+    tau : (3,) desired generalized force [X, Y, N]
+
+    Returns
+    -------
+    z : (n_z,) extended force vector [Fx1, Fy1, Fx2, Fy2, ...]
+    """
+    tau = np.asarray(tau, dtype=float)
+
+    # TODO 1: Y = H^{-1} Be^T, without forming the inverse (np.linalg.solve)
+    Y = np.linalg.solve(H, Be.T)
+    # TODO 2: M = Be Y, a small 3x3 system
+    M = Be @ Y
+    # TODO 3: w = M^{-1} tau, again with np.linalg.solve
+    w = np.linalg.solve(M, tau)
+    # TODO 4: z = Y w
+    z = Y @ w
+    return z
+
 
 # -----------------------------------------------------------------------------
 # Allocator
