@@ -198,15 +198,36 @@ def weighted_pinv_solve(Be, H, tau):
 # -----------------------------------------------------------------------------
 
 class ThrustAllocator:
-    """Thrust allocation via direct SLSQP solve of the true convex disc
-    constraint. Only invoked when the pseudo-inverse baseline violates a
-    thruster limit; otherwise falls through to the plain pseudo-inverse
-    solution. Uses an augmented decision vector [z, lambda] to preserve the
-    requested wrench direction when the full demand is infeasible."""
+    """Two-regime thrust allocator with a rotation penalty.
 
-    def __init__(self, thrusters: List[ThrusterConfig]):
+    Regime 1 (feasible demand): weighted minimum-norm solution
+        min z^T H z  s.t.  Be z = tau,   H = I + P(alpha_now),
+    solved in closed form by weighted_pinv_solve. P penalises force across
+    each azimuth's current direction, so the thrusters prefer to push along
+    where they already point. Used whenever all thrusters stay within u_max.
+
+    Regime 2 (infeasible demand): SLSQP on the augmented vector [z, lambda],
+        min -lambda + mu z^T P z
+        s.t. Be z = lambda tau,  |z_i| <= u_max,i,  0 <= lambda <= 1.
+    This delivers the largest possible fraction lambda of the requested
+    wrench in the requested direction. The small mu term only breaks ties
+    between solutions with (almost) the same lambda, costing at most about
+    1e-3 in lambda. Starts from the regime 1 solution scaled to the limit,
+    and falls back to that scaled solution if SLSQP fails.
+
+    q sets the strength of the rotation penalty (q = 0 gives the plain
+    pseudo-inverse). mu is derived from q and the azimuth u_max values.
+    """
+
+    def __init__(self, thrusters: List[ThrusterConfig], q: float = 0.1):
         self.thrusters = thrusters
         self.Be = build_Be(thrusters)  #Constant 3 x n_z effectiveness matrix, built by build_Be()
+
+        self.q = q
+        if self.q == 0.0:
+            self.mu = 0.0
+        else:
+            self.mu = 1e-3 / (self.q * sum((thr.u_max/1000)**2 for thr in self.thrusters if thr.kind == "azimuth"))  # weight for the rotation penalty, scaled to kN^2
 
         self.n_calls = 0  #counter
         self.n_triggered = 0  #counter
@@ -223,10 +244,13 @@ class ThrustAllocator:
         u_now: Optional[np.ndarray] = None,
         alpha_now: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        # TODO (Part 2, optional): convert tau_d with np.asarray(..., dtype=float)
-        # so the allocator also accepts a list
+    
         tau = np.asarray(tau_d, dtype=float)[[0, 1, 5]]
-        z = np.linalg.pinv(self.Be) @ tau
+        n_z = self.Be.shape[1]
+        Rp = build_rotation_penalty(self.thrusters, alpha_now, self.q)
+        H = np.eye(n_z) + Rp
+
+        z = weighted_pinv_solve(self.Be, H, tau)
 
         mags = magnitudes(z, self.thrusters)
         violates_limit = any(mag > thr.u_max for mag, thr in zip(mags, self.thrusters))
@@ -238,7 +262,6 @@ class ThrustAllocator:
 
             self.n_triggered += 1  #counter
 
-            n_z = self.Be.shape[1]
 
             # Needed the z-vector to be augmented with a lambda variable, so we can maximize it while minimizing the objective function.
 
@@ -247,7 +270,7 @@ class ThrustAllocator:
 
             def objective(z_bar):
                 lam = z_bar[-1]  # Retrieves the lambda variable, can not use 1/lambda because of possible divison by 0
-                return -lam  # Minimize -lambda to maximize lambda
+                return -lam + self.mu * z_bar[:-1].T @ Rp @ z_bar[:-1] # maximize lambda, small penalty on force across current azimuth direction
 
             def equality(z_bar):
                 lam = z_bar[-1]
