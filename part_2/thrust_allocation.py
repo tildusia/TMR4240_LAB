@@ -76,30 +76,6 @@ def build_Be(thrusters: List[ThrusterConfig]) -> np.ndarray:
        
     return Be
 
-def build_rotation_penalty(thrusters, alpha_now, u_now, q, u_floor_frac=0.05) -> np.ndarray:
-
-    # Penalty on the change in azimuth angle, linearised around the current state.
-    # Wanted cost per azimuth: q * u_max^2 * dalpha^2.
-    # With e_perp across the current direction, e_perp^T z_i = |z_i| sin(dalpha) ~ u_now * dalpha,
-    # so dalpha ~ e_perp^T z_i / u_now, which is linear in z and keeps the problem quadratic.
-    # u_eff has a floor so the scale stays finite when the thruster is (almost) idle.
-
-    n_z = sum(2 if th.kind == "azimuth" else 1 for th in thrusters)
-    Rp = np.zeros((n_z, n_z))
-    col = 0
-
-    for i, thr in enumerate(thrusters):
-        if thr.kind == "tunnel":
-            col += 1
-        elif thr.kind == "azimuth":
-            e = np.array([-np.sin(alpha_now[i]), np.cos(alpha_now[i])])
-            u_eff = max(abs(u_now[i]), u_floor_frac * thr.u_max)
-            scale = (thr.u_max / u_eff) ** 2
-            Rp[col:col + 2, col:col + 2] = q * scale * np.outer(e, e)
-            col += 2
-
-    return Rp
-
 def magnitudes(z: np.ndarray, thrusters: List[ThrusterConfig]) -> list: #Magnutude is needed multiple times, so it is extracted to a function to avoid code duplication
     mags = []
     col = 0
@@ -154,7 +130,7 @@ def z_to_commands(
                     alpha_cmd[i] = thr.alpha0  
 
             # Minimal rotation.
-            # (u, alpha) and (-u, alpha + pi) give the same force. Use alpha_now[i] and
+            # (u, alpha) and (-u, alpha + pi) give the same force. Alpha_now[i] and
             # wrap_angle_pi to choose the pair that needs the smaller rotation.
             
             if alpha_now is not None:
@@ -168,34 +144,38 @@ def z_to_commands(
 
     return u_cmd, alpha_cmd
 
-def weighted_pinv_solve(Be, H, tau):
-    """
-    Weighted minimum-norm solution of Be z = tau.
+# NEW (Part 2, sequential method): build_B and build_D
 
-    Solves  min_z  z^T H z   s.t.  Be z = tau,
-    with H = I + P symmetric positive definite.
+def build_B(thrusters: List[ThrusterConfig], alpha: np.ndarray) -> np.ndarray:
 
-    Parameters
-    ----------
-    Be  : (3, n_z) extended thrust configuration matrix
-    H   : (n_z, n_z) weighting matrix
-    tau : (3,) desired generalized force [X, Y, N]
+    # 3 x n thrust configuration matrix T(alpha), one column per thruster.
+    # Column i is the wrench [Fx, Fy, Mz] from thruster i per unit thrust.
+    # Same moment arm as in build_Be: Mz = x * Fy - y * Fx.
 
-    Returns
-    -------
-    z : (n_z,) extended force vector [Fx1, Fy1, Fx2, Fy2, ...]
-    """
-    tau = np.asarray(tau, dtype=float)
+    B = np.zeros((3, len(thrusters)))
+    for i, thr in enumerate(thrusters):
+        if thr.kind == "tunnel":
+            a = thr.alpha0
+        else:
+            a = alpha[i]
+        B[:, i] = [np.cos(a), np.sin(a), thr.x * np.sin(a) - thr.y * np.cos(a)]
+    return B
 
-    # TODO 1: Y = H^{-1} Be^T, without forming the inverse (np.linalg.solve)
-    Y = np.linalg.solve(H, Be.T)
-    # TODO 2: M = Be Y, a small 3x3 system
-    M = Be @ Y
-    # TODO 3: w = M^{-1} tau, again with np.linalg.solve
-    w = np.linalg.solve(M, tau)
-    # TODO 4: z = Y w
-    z = Y @ w
-    return z
+
+def build_D(thrusters: List[ThrusterConfig], alpha: np.ndarray, u: np.ndarray) -> np.ndarray:
+
+    # 3 x n_az matrix, d(T(alpha) u)/d alpha at the current state.
+    # One column per azimuth: the change in wrench per radian of rotation.
+    # Proportional to u, so an idle azimuth gives no change in wrench when it rotates.
+
+    az = [i for i, thr in enumerate(thrusters) if thr.kind == "azimuth"]
+    D = np.zeros((3, len(az)))
+    for j, i in enumerate(az):
+        thr = thrusters[i]
+        a = alpha[i]
+        # CHECK: derivative of [cos a, sin a, x sin a - y cos a] * u with respect to a
+        D[:, j] = u[i] * np.array([-np.sin(a), np.cos(a), thr.x * np.cos(a) + thr.y * np.sin(a)])
+    return D
 
 
 # -----------------------------------------------------------------------------
@@ -203,43 +183,71 @@ def weighted_pinv_solve(Be, H, tau):
 # -----------------------------------------------------------------------------
 
 class ThrustAllocator:
-    """Two-regime thrust allocator with a rotation penalty.
+    """Thrust allocator with two methods, chosen with ``method``.
 
-    Regime 1 (feasible demand): weighted minimum-norm solution
-        min z^T H z  s.t.  Be z = tau,   H = I + P(alpha_now),
-    solved in closed form by weighted_pinv_solve. P penalises the change in
-    azimuth angle, linearised around the current state, so that
-    z_i^T P_i z_i ~ q u_max,i^2 dalpha_i^2. This keeps the allocator from
-    chasing high-frequency demand content (azimuth hunting). Used whenever
-    all thrusters stay within u_max.
+    The checks build ThrustAllocator(thrusters), so the default method is the
+    one the checks see.
 
+    STEADY-STATE METHOD (method = "steady_state", the Part 1 allocator)
+    -------------------------------------------------------------------
+    Regime 1 (feasible demand): pseudo-inverse z = Be^+ tau.
     Regime 2 (infeasible demand): SLSQP on the augmented vector [z, lambda],
-        min -lambda + mu z^T P z
+        max lambda
         s.t. Be z = lambda tau,  |z_i| <= u_max,i,  0 <= lambda <= 1.
     This delivers the largest possible fraction lambda of the requested
-    wrench in the requested direction. The small mu term only breaks ties
-    between solutions with (almost) the same lambda, costing at most about
-    1e-3 in lambda. Starts from the regime 1 solution scaled to the limit,
-    and falls back to that scaled solution if SLSQP fails.
+    wrench in the requested direction. Starts from the regime 1 solution
+    scaled to the limit, and falls back to that scaled solution if SLSQP fails.
+    z_to_commands picks the (u, alpha) or (-u, alpha + pi) with the smaller
+    rotation from alpha_now.
 
-    q sets the strength of the rotation penalty (q = 0 gives the plain
-    pseudo-inverse). u_floor_frac sets the lowest thrust, as a fraction of
-    u_max, used in the linearisation. mu is recomputed every call from the
-    current P so the penalty costs at most about 1e-3 in lambda.
+    SEQUENTIAL METHOD (method = "sequential", Part 2 extension)
+    ------------------------------------------------------------
+    NEW: the same problem (largest lambda, direction kept), linearised around
+    the current actuator state (u0, alpha0) and solved for the change in this
+    step:
+
+        max   lambda - mu_alpha * sum(dalpha^2) - mu_u * sum((u0 + du)^2)
+        s.t.  T(alpha0)(u0 + du) + D dalpha = lambda tau
+              |u0 + du| <= u_max
+              |dalpha| <= rot_speed * dt
+              0 <= lambda <= 1
+
+    D = d(T(alpha) u)/d alpha at (u0, alpha0). With the linearisation the
+    force from azimuth i is z_i ~ (u0 + du) e_i + u0 dalpha e_perp,i, so
+    |u0 + du| <= u_max is the tangent to the disc |z_i| <= u_max at the
+    current angle. The tangent is a good approximation because the azimuth
+    turns at most rot_speed * dt (1.2 deg) per step, which is why dalpha is
+    bounded. Thrust is not rate limited, the thrust ramp is left to the
+    actuator model.
+
+    The direction of tau is kept exactly in every step, also while the
+    azimuths turn: the allocator then delivers a smaller lambda in the right
+    direction instead of a force pointing the wrong way. When the solution
+    stops changing (du = 0, dalpha = 0) it is a solution of the steady-state
+    problem above.
+
+    mu_alpha [1/rad^2] costs rotation and breaks ties between solutions with
+    (almost) the same lambda. It also damps chattering at the capacity limit.
+    mu_u [1/kN^2] is a small thrust cost.
+
+    Not included from the survey (Fossen and Johansen, eq. 27): the slack s
+    (the direction is kept exactly instead) and the singularity term.
     """
 
-    def __init__(self, thrusters: List[ThrusterConfig], q: float = 1.0, u_floor_frac: float = 0.05):
+    def __init__(self, thrusters: List[ThrusterConfig], method: str = "steady_state",
+                 mu_alpha: float = 0.1, mu_u: float = 1e-6):
         self.thrusters = thrusters
         self.Be = build_Be(thrusters)  #Constant 3 x n_z effectiveness matrix, built by build_Be()
+        self.Be_pinv = np.linalg.pinv(self.Be)  # CHANGED: pseudo-inverse computed once, as in Part 1
 
-        self.q = q  # rotation penalty weight, dimensionless (cost of q * u_max^2 * dalpha^2)
-        self.u_floor_frac = u_floor_frac  # floor on |u_now| in the linearisation, fraction of u_max
+        # Choice of method
+        if method not in ("steady_state", "sequential"):
+            raise ValueError(f"unknown method {method!r}, use 'steady_state' or 'sequential'")
+        self.method = method
 
-        self.n_calls = 0  #counter
-        self.n_triggered = 0  #counter
-        self.n_optimized = 0  #counter
-        self.n_fallback = 0  #counter
-        self.last_used_optimizer = False  #counter
+        # Weights for the sequential method
+        self.mu_alpha = mu_alpha  # cost on the change in azimuth angle per step [1/rad^2]
+        self.mu_u = mu_u  # small cost on thrust [1/kN^2]
 
 
     def allocate(
@@ -250,37 +258,94 @@ class ThrustAllocator:
         u_now: Optional[np.ndarray] = None,
         alpha_now: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
-    
+
+        # Switch for the method
+        if self.method == "sequential":
+            return self.allocate_sequential(t, dt, tau_d, u_now, alpha_now)
+        return self.allocate_steady_state(t, dt, tau_d, u_now, alpha_now)
+
+
+    # PART 2: allocate_sequential method
+    def allocate_sequential(self, t, dt, tau_d, u_now, alpha_now):
+
+        SCALE = 1000.0  # work in kN and kNm, same as in the steady-state SLSQP
+        thrusters = self.thrusters
+        n = len(thrusters)
+        az = [i for i, thr in enumerate(thrusters) if thr.kind == "azimuth"]
+        n_az = len(az)
+
+        tau = np.asarray(tau_d, dtype=float)[[0, 1, 5]] / SCALE
+        u0 = np.asarray(u_now, dtype=float) / SCALE
+        alpha0 = np.asarray(alpha_now, dtype=float)
+
+        # Step 1: linearised wrench around the current state.
+        # T(alpha0 + dalpha)(u0 + du) ~ T(alpha0)(u0 + du) + D dalpha
+        B = build_B(thrusters, alpha0)
+        D = build_D(thrusters, alpha0, u0)
+
+        # Step 2: the optimisation variable x = [du (n), dalpha (n_az), lambda].
+        def objective(x):
+            du, dalpha, lam = x[:n], x[n:n + n_az], x[-1]
+            return -lam + self.mu_alpha * np.sum(dalpha ** 2) + self.mu_u * np.sum((u0 + du) ** 2)
+
+        def equality(x):
+            du, dalpha, lam = x[:n], x[n:n + n_az], x[-1]
+            return B @ (u0 + du) + D @ dalpha - lam * tau  # same direction as tau, exactly
+
+        # Gradients. SLSQP gets stuck at lambda = 0 for large demands without them.
+        def objective_grad(x):
+            du, dalpha = x[:n], x[n:n + n_az]
+            return np.concatenate([2 * self.mu_u * (u0 + du), 2 * self.mu_alpha * dalpha, [-1.0]])
+
+        def equality_jac(x):
+            return np.hstack([B, D, -tau[:, None]])
+
+        # Step 3: bounds.
+        # du: total thrust within u_max (the tangent to the disc for an azimuth).
+        # dalpha: at most one step of rotation, so the tangent stays a good approximation.
+        u_max = np.array([thr.u_max for thr in thrusters]) / SCALE
+        dalpha_max = np.array([thrusters[i].rot_speed * dt for i in az])
+
+        bounds = [(-u_max[i] - u0[i], u_max[i] - u0[i]) for i in range(n)]
+        bounds += [(-dalpha_max[j], dalpha_max[j]) for j in range(n_az)]
+        bounds += [(0.0, 1.0)]
+
+        # Step 4: solve, starting from "no change" (x = 0).
+        x0 = np.zeros(n + n_az + 1)
+        res = minimize(objective, x0, jac=objective_grad, method="SLSQP", bounds=bounds,
+                       constraints=[{"type": "eq", "fun": equality, "jac": equality_jac}],
+                       options={"ftol": 1e-10, "maxiter": 200})
+        x = res.x
+
+        # Step 5: check the solution, fall back to the steady-state method if it is not usable.
+        if not res.success or np.max(np.abs(equality(x))) > 1e-3:
+            print(f"t={t:.1f}: sequential allocation failed ({res.message}), using steady-state")
+            return self.allocate_steady_state(t, dt, tau_d, u_now, alpha_now)
+
+        # Step 6: back to commands.
+        # No minimal-rotation flip needed: u is signed and dalpha is at most one step.
+        u_cmd = (u0 + x[:n]) * SCALE
+        alpha_cmd = alpha0.copy()
+        for j, i in enumerate(az):
+            alpha_cmd[i] = alpha0[i] + x[n + j]
+        for i, thr in enumerate(thrusters):
+            if thr.kind == "tunnel":
+                alpha_cmd[i] = thr.alpha0
+
+        return u_cmd, alpha_cmd
+
+
+    def allocate_steady_state(self, t, dt, tau_d, u_now, alpha_now):
+
         tau = np.asarray(tau_d, dtype=float)[[0, 1, 5]]
         n_z = self.Be.shape[1]
-        Rp = build_rotation_penalty(self.thrusters, alpha_now, u_now, self.q, self.u_floor_frac)
-        H = np.eye(n_z) + Rp
 
-        # mu for the SLSQP objective, from the derived bound
-        #   lambda* - lambda_mu <= mu * sum_i lambda_max(P_i) * u_max,i^2   (u_max in kN)
-        # Each azimuth block is rank 1, so its largest eigenvalue is its trace.
-        bound = 0.0
-        col = 0
-        for thr in self.thrusters:
-            if thr.kind == "tunnel":
-                col += 1
-            elif thr.kind == "azimuth":
-                bound += np.trace(Rp[col:col + 2, col:col + 2]) * (thr.u_max / 1000) ** 2
-                col += 2
-        mu = 1e-3 / bound if bound > 0.0 else 0.0
-
-        z = weighted_pinv_solve(self.Be, H, tau)
+        z = self.Be_pinv @ tau
 
         mags = magnitudes(z, self.thrusters)
         violates_limit = any(mag > thr.u_max for mag, thr in zip(mags, self.thrusters))
 
-        self.n_calls += 1  #counter
-        self.last_used_optimizer = violates_limit  #counter
-
         if violates_limit:
-
-            self.n_triggered += 1  #counter
-
 
             # Needed the z-vector to be augmented with a lambda variable, so we can maximize it while minimizing the objective function.
 
@@ -289,7 +354,7 @@ class ThrustAllocator:
 
             def objective(z_bar):
                 lam = z_bar[-1]  # Retrieves the lambda variable, can not use 1/lambda because of possible divison by 0
-                return -lam + mu * z_bar[:-1] @ Rp @ z_bar[:-1]  # maximize lambda, small penalty on azimuth rotation as tie-breaker
+                return -lam  # CHANGED: maximize lambda only (the mu * z^T P z tie-breaker is removed)
 
             def equality(z_bar):
                 lam = z_bar[-1]
@@ -336,10 +401,8 @@ class ThrustAllocator:
             limits_ok = all(mag <= thr.u_max + TOL * 1000 for mag, thr in zip(magnitudes_candidate, self.thrusters))
 
             if residual_ok and limits_ok:
-                self.n_optimized += 1  #counter
                 z = z_candidate
             else:
-                self.n_fallback += 1  #counter
                 #Check if tolerance is needed
                 if not limits_ok:
                     violations = [

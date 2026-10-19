@@ -1,36 +1,55 @@
 """
-Thrust allocation analysis: sweep of the rotation penalty weight q.
+Thrust allocation analysis: steady-state (Part 1) vs sequential allocator, open loop.
 
-Open-loop study (no controller, no vessel). A desired wrench tau_d(t) is fed
+Open-loop study (no controller, no vessel). A commanded wrench tau_c(t) is fed
 to ThrustAllocator every time step. The commands go through ThrusterSet with
 dynamics on (same rate limits as in the simulator), and the actual actuator
-state is fed back as u_now / alpha_now. This isolates the effect of q on the
-allocator itself.
+state is fed back as u_now / alpha_now. This isolates the allocator from the
+rest of the DP loop.
+
+Both methods are run on the same scenario and drawn in the same plots, as
+recommended in the task text and by the lecturer:
+    - commanded vs actual wrench, and the residual r_tau = tau_c - tau_thr
+    - commanded vs actual thrust per thruster
+    - commanded vs actual azimuth angle per azimuth
 
 Run from the repo root (TMR4240_LAB):
     python -m part_2.analysis.thrust_allocation_analysis
-    python -m part_2.analysis.thrust_allocation_analysis --scenario noisy --show
+    python -m part_2.analysis.thrust_allocation_analysis --scenario steps --show
 
 Scenarios
 ---------
-rotating   : constant force turning slowly through 360 deg (necessary rotation)
-steps      : constant force jumping between directions (necessary rotation)
-noisy      : constant mean force plus wave-like oscillations. After the warm-up
-             the mean needs no rotation, so all measured rotation is unnecessary
-             (azimuth hunting). This is what the rotation penalty is meant for.
-noisy_low  : as noisy, but with a low mean force, where hunting is worst
+steps       : 40 kN jumping between directions every 30 s, incl. a 180 deg turn.
+              Feasible, so only the actuator transient shows up in r_tau.
+saturation  : infeasible demands (200 kN sway, then 150 kN + 150 kN).
+              Shows delivered capacity and whether the direction is kept.
+rotating    : 40 kN turning slowly through 360 deg (necessary, smooth rotation)
+noisy       : 20 kN mean plus wave-like oscillations (sinusoids with wave periods).
+              After the warm-up all rotation is unnecessary (azimuth hunting).
+noisy_low   : as noisy, but 6 kN mean, where hunting is worst
+random      : 20 kN mean plus band-limited random noise on Fx, Fy and Mz
+              (seeded first-order filtered Gaussian noise, time constant 1 s),
+              like a controller reacting to noisy measurements
+
+Residual split (memory of the task text: keep steady state and transient apart)
+-------------------------------------------------------------------------------
+r_tau     = tau_c - tau_thr                      total residual
+r_alloc   = tau_c - tau_alloc                    steady-state part: demand above capacity
+r_act     = tau_alloc - tau_thr                  actuator part: thrust ramps and slewing
+tau_alloc = T(alpha_cmd) u_cmd is the wrench the commands would give with ideal actuators.
+
+Metrics (after the scenario's warm-up)
+-------
+rms r_tau F / M   : RMS of the total residual, force [kN] and moment [kNm]
+rms r_alloc F     : RMS of the steady-state part, force [kN]
+rms r_act F       : RMS of the actuator part, force [kN]
+rotation          : total azimuth rotation, sum_k sum_i |alpha_i[k] - alpha_i[k-1]|  [deg]
+effort            : sum_k sum_i u_i[k]^2 * dt                                     [kN^2 s]
+capacity          : delivered force along the commanded direction / commanded, at the end [-]
+direction error   : delivered force across the commanded direction at the end     [kN]
+                    (both only when the command is constant at the end, else "-")
 
 Figures are written to figures/thrust_allocation_analysis/.
-
-Metrics per run (computed after the scenario's warm-up time)
----------------
-rotation   : total azimuth rotation, sum_k sum_i |alpha_i[k] - alpha_i[k-1]|  [deg]
-effort     : thrust effort, sum_k sum_i u_i[k]^2 * dt                          [kN^2 s]
-act_res    : RMS of tau_alloc - tau_thr (actuator part of the residual)       [kN], [kNm]
-track_res  : RMS of tau_d - tau_thr (total delivered vs desired)              [kN], [kNm]
-
-tau_alloc is the wrench the commands would give with ideal actuators, and
-tau_thr is the wrench the rate-limited actuators actually deliver.
 """
 import argparse
 from pathlib import Path
@@ -44,16 +63,20 @@ from models.thruster_dynamics import ThrusterSet
 
 
 DT = 0.1                                     # same as run_case_part_2.py
-Q_VALUES = [0.0, 1.0, 2.0, 3.0, 5.0, 10.0]
-Q_TIMESERIES = [0.0, 3.0, 10.0]
 OUT_DIR = Path("figures") / "thrust_allocation_analysis"
 
+# name: (keyword arguments to ThrustAllocator, colour in the plots)
+METHODS = {
+    "steady-state": (dict(method="steady_state"), "C0"),
+    "sequential": (dict(method="sequential"), "C1"),
+}
+
 
 # -----------------------------------------------------------------------------
-# Scenarios: desired BODY wrench tau_d(t), shape (6,)
+# Scenarios: commanded BODY wrench tau_c(t), shape (6,)
 # -----------------------------------------------------------------------------
 
-F_DEMAND = 40e3      # [N], well inside capacity so regime 1 dominates
+F_DEMAND = 40e3      # [N], well inside capacity
 T_ROT = 120.0        # [s], time for one full turn in the rotating scenario
 STEP_DIRS_DEG = [0.0, 90.0, 180.0, 45.0, -120.0, 0.0]
 STEP_HOLD = 30.0     # [s] per direction in the step scenario
@@ -72,10 +95,20 @@ def scenario_steps(t):
     return np.array([F_DEMAND * np.cos(phi), F_DEMAND * np.sin(phi), 0.0, 0.0, 0.0, 0.0])
 
 
+SAT_HOLD = 60.0      # [s] per demand in the saturation scenario
+
+
+def scenario_saturation(t):
+    """Infeasible demands: 200 kN sway, then 150 kN surge + 150 kN sway."""
+    if t < SAT_HOLD:
+        return np.array([0.0, 200e3, 0.0, 0.0, 0.0, 0.0])
+    return np.array([150e3, 150e3, 0.0, 0.0, 0.0, 0.0])
+
+
 # Wave-like content: two sinusoids per DOF with periods in the wave band (5-12 s),
 # so the demand direction wobbles around a constant mean.
 NOISY_DIR_DEG = 30.0  # direction of the mean force [deg]
-NOISY_OSC = [         # (DOF index in tau_d, amplitude, period [s], phase [rad])
+NOISY_OSC = [         # (DOF index in tau_c, amplitude, period [s], phase [rad])
     (0, 4e3, 8.0, 0.0), (0, 2e3, 5.3, 1.1),
     (1, 4e3, 9.5, 0.7), (1, 2e3, 6.1, 2.3),
     (5, 40e3, 11.0, 0.4), (5, 20e3, 7.2, 1.9),
@@ -101,21 +134,56 @@ def scenario_noisy_low(t):
     return _noisy(t, 6e3)
 
 
-# name: (tau_d(t), duration [s], warm-up excluded from the metrics [s])
+# Random noise: constant mean force plus band-limited Gaussian noise on Fx, Fy and Mz,
+# like a controller reacting to noisy measurements. Seeded, so both methods (and every run)
+# see exactly the same demand.
+RANDOM_T = 300.0                       # [s] length of the scenario
+RANDOM_MEAN = (17e3, 10e3, 0.0)        # [N, N, Nm] mean demand (about 20 kN at 30 deg)
+RANDOM_STD = (4e3, 4e3, 40e3)          # [N, N, Nm] standard deviation of the noise
+RANDOM_TC = 1.0                        # [s] time constant of the first-order filter
+RANDOM_SEED = 1
+
+
+def _make_random_noise():
+    rng = np.random.default_rng(RANDOM_SEED)
+    n = int(round(RANDOM_T / DT)) + 1
+    a = np.exp(-DT / RANDOM_TC)
+    w = np.zeros((n, 3))
+    for k in range(1, n):
+        # first-order low-pass of white noise, scaled so the output has the wanted std
+        w[k] = a * w[k - 1] + np.sqrt(1 - a ** 2) * rng.standard_normal(3)
+    return np.asarray(RANDOM_MEAN) + w * np.asarray(RANDOM_STD)
+
+
+RANDOM_SERIES = _make_random_noise()
+
+
+def scenario_random(t):
+    """Mean force (about 20 kN) with band-limited random noise."""
+    k = min(int(round(t / DT)), len(RANDOM_SERIES) - 1)
+    Fx, Fy, Mz = RANDOM_SERIES[k]
+    return np.array([Fx, Fy, 0.0, 0.0, 0.0, Mz])
+
+
+# name: (tau_c(t), duration [s], warm-up excluded from the metrics [s])
+# (also imported by allocator_comparison.py)
 SCENARIOS = {
-    "rotating": (scenario_rotating, 180.0, 0.0),
     "steps": (scenario_steps, STEP_HOLD * len(STEP_DIRS_DEG), 0.0),
+    "saturation": (scenario_saturation, 2 * SAT_HOLD, 0.0),
+    "rotating": (scenario_rotating, 180.0, 0.0),
     "noisy": (scenario_noisy, 300.0, NOISY_WARMUP),
     "noisy_low": (scenario_noisy_low, 300.0, NOISY_WARMUP),
+    "random": (scenario_random, RANDOM_T, NOISY_WARMUP),
 }
+DEFAULT_SCENARIOS = ["steps", "saturation", "rotating", "noisy", "noisy_low", "random"]
 
 
 # -----------------------------------------------------------------------------
 # One open-loop run
 # -----------------------------------------------------------------------------
 
-def run(thrusters, q, tau_fun, T):
-    alloc = ThrustAllocator(thrusters, q=q)
+def run(thrusters, alloc_kwargs, tau_fun, T):
+    alloc = ThrustAllocator(thrusters, **alloc_kwargs)
     ts = ThrusterSet(thrusters, dynamics=True)
 
     n_steps = int(round(T / DT))
@@ -124,7 +192,7 @@ def run(thrusters, q, tau_fun, T):
 
     log = {
         "t": t,
-        "tau_d": np.zeros((n_steps, 3)),
+        "tau_c": np.zeros((n_steps, 3)),
         "tau_alloc": np.zeros((n_steps, 3)),
         "tau_thr": np.zeros((n_steps, 3)),
         "u_cmd": np.zeros((n_steps, n)),
@@ -134,14 +202,14 @@ def run(thrusters, q, tau_fun, T):
     }
 
     for k, tk in enumerate(t):
-        tau_d = tau_fun(tk)
+        tau_c = tau_fun(tk)
         u_now = ts.get_thrusts()
         alpha_now = ts.get_angles()
 
-        u_cmd, alpha_cmd = alloc.allocate(tk, DT, tau_d, u_now, alpha_now)
+        u_cmd, alpha_cmd = alloc.allocate(tk, DT, tau_c, u_now, alpha_now)
         u, alpha, tau_thr = ts.step(u_cmd, alpha_cmd, DT)
 
-        log["tau_d"][k] = tau_d[[0, 1, 5]]
+        log["tau_c"][k] = tau_c[[0, 1, 5]]
         log["tau_alloc"][k] = ts._wrench_from(u_cmd, alpha_cmd)
         log["tau_thr"][k] = tau_thr
         log["u_cmd"][k] = u_cmd
@@ -149,9 +217,6 @@ def run(thrusters, q, tau_fun, T):
         log["u"][k] = u
         log["alpha"][k] = alpha
 
-    log["n_calls"] = alloc.n_calls
-    log["n_triggered"] = alloc.n_triggered
-    log["n_fallback"] = alloc.n_fallback
     return log
 
 
@@ -176,93 +241,111 @@ def _rms_moment(d):
 def metrics(log, thrusters, t_skip=0.0):
     az = [i for i, th in enumerate(thrusters) if th.kind == "azimuth"]
     keep = log["t"] >= t_skip
-    alpha = log["alpha"][keep][:, az]
-    dalpha = _wrap(np.diff(alpha, axis=0))
+    dalpha = _wrap(np.diff(log["alpha"][keep][:, az], axis=0))
 
-    act = (log["tau_alloc"] - log["tau_thr"])[keep]
-    trk = (log["tau_d"] - log["tau_thr"])[keep]
+    r_tau = (log["tau_c"] - log["tau_thr"])[keep]
+    r_alloc = (log["tau_c"] - log["tau_alloc"])[keep]
+    r_act = (log["tau_alloc"] - log["tau_thr"])[keep]
+
+    # Delivered vs commanded at the end, along and across the commanded direction.
+    # Only meaningful when the command is constant at the end (steps, saturation),
+    # otherwise NaN (printed as "-").
+    tau_c_end, tau_thr_end = log["tau_c"][-1] / 1e3, log["tau_thr"][-1] / 1e3
+    last = log["t"] >= log["t"][-1] - 5.0
+    if np.ptp(log["tau_c"][last], axis=0).max() < 1.0:
+        d = tau_c_end / np.linalg.norm(tau_c_end)
+        along = tau_thr_end @ d
+        capacity, dir_error = along / np.linalg.norm(tau_c_end), np.linalg.norm(tau_thr_end - along * d)
+    else:
+        capacity, dir_error = np.nan, np.nan
 
     return {
+        "rms_r_tau_F": _rms_force(r_tau),
+        "rms_r_tau_M": _rms_moment(r_tau),
+        "rms_r_alloc_F": _rms_force(r_alloc),
+        "rms_r_act_F": _rms_force(r_act),
         "rotation": np.degrees(np.sum(np.abs(dalpha))),
         "effort": np.sum(log["u"][keep] ** 2) * DT / 1e6,
-        "act_res_F": _rms_force(act),
-        "act_res_M": _rms_moment(act),
-        "track_res_F": _rms_force(trk),
-        "track_res_M": _rms_moment(trk),
-        "slsqp_share": log["n_triggered"] / max(log["n_calls"], 1),
-        "fallbacks": log["n_fallback"],
+        "capacity": capacity,
+        "dir_error": dir_error,
     }
 
 
 # -----------------------------------------------------------------------------
-# Plots
+# Plots: both methods in the same axes
 # -----------------------------------------------------------------------------
 
-def plot_metrics_vs_q(results, scenario):
-    keys = [
-        ("rotation", "Total azimuth rotation [deg]"),
-        ("effort", r"Thrust effort $\sum u^2 \Delta t$ [kN$^2$ s]"),
-        ("act_res_F", r"RMS $\|\tau_{alloc} - \tau_{thr}\|$ force [kN]"),
-        ("track_res_F", r"RMS $\|\tau_d - \tau_{thr}\|$ force [kN]"),
-    ]
-    q_pos = [q for q in results if q > 0]
+WRENCH_ROWS = (("Fx [kN]", 0), ("Fy [kN]", 1), ("Mz [kNm]", 2))
 
-    fig, axes = plt.subplots(2, 2, figsize=(10, 7))
-    for ax, (key, label) in zip(axes.ravel(), keys):
-        ax.semilogx(q_pos, [results[q][key] for q in q_pos], "o-")
-        if 0.0 in results:
-            ax.axhline(results[0.0][key], ls="--", color="gray", label="q = 0")
-            ax.legend()
-        ax.set_xlabel("q")
+
+def plot_wrench(logs, scenario):
+    """Left: commanded vs actual wrench. Right: residual r_tau = tau_c - tau_thr."""
+    fig, axes = plt.subplots(3, 2, figsize=(13, 7.5), sharex=True)
+    t = next(iter(logs.values()))["t"]
+    tau_c = next(iter(logs.values()))["tau_c"]      # the same command for both methods
+    for row, (label, j) in enumerate(WRENCH_ROWS):
+        ax = axes[row, 0]
+        ax.plot(t, tau_c[:, j] / 1e3, "k--", lw=1.2, label=r"commanded $\tau_c$")
+        for name, log in logs.items():
+            ax.plot(t, log["tau_thr"][:, j] / 1e3, color=METHODS[name][1],
+                    label=rf"actual $\tau_{{thr}}$, {name}")
         ax.set_ylabel(label)
-        ax.grid(True, which="both", alpha=0.3)
-    fig.suptitle(f"Rotation penalty sweep, scenario: {scenario}")
-    fig.tight_layout()
-    return fig
 
+        ax = axes[row, 1]
+        for name, log in logs.items():
+            ax.plot(t, (log["tau_c"][:, j] - log["tau_thr"][:, j]) / 1e3,
+                    color=METHODS[name][1], label=name)
+        ax.axhline(0.0, color="black", lw=0.7, alpha=0.5)
+        ax.set_ylabel(f"residual {label}")
 
-def plot_tradeoff(results, scenario):
-    fig, ax = plt.subplots(figsize=(6, 5))
-    qs = list(results)
-    x = [results[q]["rotation"] for q in qs]
-    y = [results[q]["effort"] for q in qs]
-    ax.plot(x, y, "o-")
-    for q, xi, yi in zip(qs, x, y):
-        ax.annotate(f"q={q:g}", (xi, yi), textcoords="offset points", xytext=(6, 4))
-    ax.set_xlabel("Total azimuth rotation [deg]")
-    ax.set_ylabel(r"Thrust effort [kN$^2$ s]")
-    ax.set_title(f"Rotation vs effort, scenario: {scenario}")
-    ax.grid(True, alpha=0.3)
-    fig.tight_layout()
-    return fig
-
-
-def plot_timeseries(logs, thrusters, scenario):
-    az = [i for i, th in enumerate(thrusters) if th.kind == "azimuth"]
-    fig, axes = plt.subplots(len(az) + 3, 1, figsize=(10, 2.2 * (len(az) + 3)), sharex=True)
-
-    for q, log in logs.items():
-        t = log["t"]
-        for row, i in enumerate(az):
-            axes[row].plot(t, np.degrees(np.unwrap(log["alpha"][:, i])), label=f"q={q:g}")  # unwrap: no false 360 deg jumps at +-180
-            axes[row].set_ylabel(f"alpha {thrusters[i].name} [deg]")
-        axes[len(az)].plot(t, np.linalg.norm(log["u"], axis=1) / 1e3, label=f"q={q:g}")
-        axes[len(az) + 1].plot(t, log["tau_thr"][:, 0] / 1e3, label=f"q={q:g}")
-        axes[len(az) + 2].plot(t, log["tau_thr"][:, 1] / 1e3, label=f"q={q:g}")
-
-    ref = next(iter(logs.values()))
-    axes[len(az) + 1].plot(ref["t"], ref["tau_d"][:, 0] / 1e3, "k--", lw=1, label="desired")
-    axes[len(az) + 2].plot(ref["t"], ref["tau_d"][:, 1] / 1e3, "k--", lw=1, label="desired")
-
-    axes[len(az)].set_ylabel(r"$\|u\|$ [kN]")
-    axes[len(az) + 1].set_ylabel(r"$F_x$ delivered [kN]")
-    axes[len(az) + 2].set_ylabel(r"$F_y$ delivered [kN]")
-    axes[-1].set_xlabel("t [s]")
-    for ax in axes:
+    axes[0, 0].set_title(r"Commanded vs actual wrench")
+    axes[0, 1].set_title(r"Residual $r_\tau = \tau_c - \tau_{thr}$")
+    axes[0, 0].legend(fontsize=8, loc="best")
+    axes[0, 1].legend(fontsize=8, loc="best")
+    for ax in axes.flat:
         ax.grid(True, alpha=0.3)
-    axes[0].legend(loc="upper right", ncol=len(logs))
-    axes[-1].legend(loc="upper right", ncol=len(logs) + 1)
-    fig.suptitle(f"Time series, scenario: {scenario}")
+    for ax in axes[-1]:
+        ax.set_xlabel("Time [s]")
+    fig.suptitle(f"Wrench, open loop, scenario: {scenario}")
+    fig.tight_layout()
+    return fig
+
+
+def plot_thrust(logs, thrusters, scenario):
+    """Commanded (dashed) vs actual (solid) thrust per thruster."""
+    fig, axes = plt.subplots(len(thrusters), 1, figsize=(12, 7.5), sharex=True)
+    for i, (ax, thr) in enumerate(zip(axes, thrusters)):
+        for name, log in logs.items():
+            c = METHODS[name][1]
+            ax.plot(log["t"], log["u_cmd"][:, i] / 1e3, "--", color=c, lw=1.0, label=f"commanded, {name}")
+            ax.plot(log["t"], log["u"][:, i] / 1e3, color=c, label=f"actual, {name}")
+        ax.axhline(thr.u_max / 1e3, color="grey", lw=0.8, ls=":")
+        ax.axhline(-thr.u_max / 1e3, color="grey", lw=0.8, ls=":")
+        ax.set_ylabel(f"{thr.name}\nthrust [kN]")
+        ax.grid(True, alpha=0.3)
+    axes[0].legend(fontsize=8, loc="best", ncol=2)
+    axes[-1].set_xlabel("Time [s]")
+    fig.suptitle(f"Thrust, commanded vs actual (dotted: $\\pm u_{{max}}$), scenario: {scenario}")
+    fig.tight_layout()
+    return fig
+
+
+def plot_azimuth(logs, thrusters, scenario):
+    """Commanded (dashed) vs actual (solid) azimuth angle, unwrapped."""
+    az = [i for i, th in enumerate(thrusters) if th.kind == "azimuth"]
+    fig, axes = plt.subplots(len(az), 1, figsize=(12, 6), sharex=True)
+    for ax, i in zip(np.atleast_1d(axes), az):
+        for name, log in logs.items():
+            c = METHODS[name][1]
+            # unwrap: no false 360 deg jumps at +-180
+            ax.plot(log["t"], np.degrees(np.unwrap(log["alpha_cmd"][:, i])), "--", color=c, lw=1.0,
+                    label=f"commanded, {name}")
+            ax.plot(log["t"], np.degrees(np.unwrap(log["alpha"][:, i])), color=c, label=f"actual, {name}")
+        ax.set_ylabel(f"{thrusters[i].name}\nangle [deg]")
+        ax.grid(True, alpha=0.3)
+    np.atleast_1d(axes)[0].legend(fontsize=8, loc="best", ncol=2)
+    np.atleast_1d(axes)[-1].set_xlabel("Time [s]")
+    fig.suptitle(f"Azimuth angle, commanded vs actual (unwrapped), scenario: {scenario}")
     fig.tight_layout()
     return fig
 
@@ -273,48 +356,49 @@ def plot_timeseries(logs, thrusters, scenario):
 
 def print_table(results, scenario, t_skip=0.0):
     print(f"\nScenario: {scenario}" + (f"  (metrics from t = {t_skip:g} s)" if t_skip else ""))
-    header = (f"{'q':>8} {'rot [deg]':>10} {'effort':>10} {'act F':>8} {'act M':>8} "
-              f"{'trk F':>8} {'trk M':>8} {'SLSQP %':>8} {'fallb.':>7}")
+    header = (f"{'method':>14} {'r_tau F':>8} {'r_tau M':>8} {'r_alloc F':>9} {'r_act F':>8} "
+              f"{'rot [deg]':>10} {'effort':>9} {'capacity':>9} {'dir err':>8}")
     print(header)
     print("-" * len(header))
-    for q, m in results.items():
-        print(f"{q:>8g} {m['rotation']:>10.1f} {m['effort']:>10.1f} "
-              f"{m['act_res_F']:>8.2f} {m['act_res_M']:>8.1f} "
-              f"{m['track_res_F']:>8.2f} {m['track_res_M']:>8.1f} "
-              f"{100 * m['slsqp_share']:>8.1f} {m['fallbacks']:>7d}")
+    for name, m in results.items():
+        print(f"{name:>14} {m['rms_r_tau_F']:>8.2f} {m['rms_r_tau_M']:>8.1f} {m['rms_r_alloc_F']:>9.2f} "
+              f"{m['rms_r_act_F']:>8.2f} {m['rotation']:>10.1f} {m['effort']:>9.1f} "
+              + (f"{m['capacity']:>9.3f} {m['dir_error']:>8.2f}" if np.isfinite(m["capacity"])
+                 else f"{'-':>9} {'-':>8}"))
 
 
 def analyse(scenario, show):
     tau_fun, T, t_skip = SCENARIOS[scenario]
     thrusters = default_thrusters_part_2()
 
-    logs = {q: run(thrusters, q, tau_fun, T) for q in Q_VALUES}
-    results = {q: metrics(log, thrusters, t_skip) for q, log in logs.items()}
+    logs = {name: run(thrusters, kwargs, tau_fun, T) for name, (kwargs, _) in METHODS.items()}
+    results = {name: metrics(log, thrusters, t_skip) for name, log in logs.items()}
     print_table(results, scenario, t_skip)
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     figs = {
-        "metrics_vs_q": plot_metrics_vs_q(results, scenario),
-        "tradeoff": plot_tradeoff(results, scenario),
-        "timeseries": plot_timeseries({q: logs[q] for q in Q_TIMESERIES if q in logs},
-                                      thrusters, scenario),
+        "wrench": plot_wrench(logs, scenario),
+        "thrust": plot_thrust(logs, thrusters, scenario),
+        "azimuth": plot_azimuth(logs, thrusters, scenario),
     }
-    for name, fig in figs.items():
-        path = OUT_DIR / f"{scenario}_{name}.png"
+    for key, fig in figs.items():
+        path = OUT_DIR / f"{scenario}_{key}.png"
         fig.savefig(path, dpi=150)
         print(f"saved {path}")
     if not show:
         plt.close("all")
+    return results
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[1])
-    parser.add_argument("--scenario", choices=[*SCENARIOS, "all"], default="all")
-    parser.add_argument("--show", action="store_true", help="show figures after saving")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--scenario", choices=list(SCENARIOS) + ["all"], default="all")
+    parser.add_argument("--show", action="store_true", help="show the figures as well")
     args = parser.parse_args()
 
-    for sc in (SCENARIOS if args.scenario == "all" else [args.scenario]):
-        analyse(sc, args.show)
+    scenarios = DEFAULT_SCENARIOS if args.scenario == "all" else [args.scenario]
+    for scenario in scenarios:
+        analyse(scenario, args.show)
     if args.show:
         plt.show()
 
