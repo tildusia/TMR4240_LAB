@@ -144,7 +144,7 @@ def z_to_commands(
 
     return u_cmd, alpha_cmd
 
-# NEW (Part 2, sequential method): build_B and build_D
+# Part 2, JFB method: build_B, build_D and the singularity measure
 
 def build_B(thrusters: List[ThrusterConfig], alpha: np.ndarray) -> np.ndarray:
 
@@ -178,6 +178,16 @@ def build_D(thrusters: List[ThrusterConfig], alpha: np.ndarray, u: np.ndarray) -
     return D
 
 
+def singularity_measure(thrusters: List[ThrusterConfig], alpha: np.ndarray) -> float:
+
+    # det(B(alpha) B(alpha)^T) from JFB (2004), eq. (3).
+    # Zero when B(alpha) loses rank, i.e. the thrusters cannot produce a wrench in every direction
+    # (for this vessel: both azimuths at +-90 deg, then no thruster gives surge).
+    # With 3 thrusters B is 3 x 3, so this equals det(B)^2.
+    B = build_B(thrusters, alpha)
+    return float(np.linalg.det(B @ B.T))
+
+
 # -----------------------------------------------------------------------------
 # Allocator
 # -----------------------------------------------------------------------------
@@ -200,54 +210,73 @@ class ThrustAllocator:
     z_to_commands picks the (u, alpha) or (-u, alpha + pi) with the smaller
     rotation from alpha_now.
 
-    SEQUENTIAL METHOD (method = "sequential", Part 2 extension)
-    ------------------------------------------------------------
-    NEW: the same problem (largest lambda, direction kept), linearised around
-    the current actuator state (u0, alpha0) and solved for the change in this
-    step:
+    JFB METHOD (method = "jfb", Part 2 continuation of Part 1)
+    -----------------------------------------------------------
+    NEW: the quasi-dynamic allocation of Johansen, Fossen and Berge (2004),
+    with the Part 1 rule for saturation (largest lambda, direction kept)
+    instead of the slack s. Nonlinear program, paper eq. (3)-(7):
 
-        max   lambda - mu_alpha * sum(dalpha^2) - mu_u * sum((u0 + du)^2)
-        s.t.  T(alpha0)(u0 + du) + D dalpha = lambda tau
+        min   -lambda + mu_u sum u_i^2 + mu_alpha sum (alpha_i - alpha0_i)^2
+                      + rho / (eps + det(B(alpha) B(alpha)^T))
+        s.t.  B(alpha) u = lambda tau
+              |u_i| <= u_max,i
+              |alpha_i - alpha0_i| <= rot_speed * dt
+              0 <= lambda <= 1
+
+    alpha0, u0 = the commands from the previous step (paper: "the previous
+    sample optimal solution"). Linearised around (u0, alpha0) and solved for
+    the change du, dalpha in each step, paper eq. (8)-(12):
+
+        min   -lambda + mu_u sum (u0 + du)^2 + mu_alpha sum dalpha^2
+                      + rho * dg/dalpha(alpha0) dalpha,     g = 1 / (eps + det(B B^T))
+        s.t.  B(alpha0)(u0 + du) + D dalpha = lambda tau
               |u0 + du| <= u_max
               |dalpha| <= rot_speed * dt
               0 <= lambda <= 1
 
-    D = d(T(alpha) u)/d alpha at (u0, alpha0). With the linearisation the
-    force from azimuth i is z_i ~ (u0 + du) e_i + u0 dalpha e_perp,i, so
-    |u0 + du| <= u_max is the tangent to the disc |z_i| <= u_max at the
-    current angle. The tangent is a good approximation because the azimuth
-    turns at most rot_speed * dt (1.2 deg) per step, which is why dalpha is
-    bounded. Thrust is not rate limited, the thrust ramp is left to the
-    actuator model.
+    D = d(B(alpha) u)/d alpha at (u0, alpha0). The problem is convex (a QP)
+    and solved with SLSQP. It is always feasible: du = -u0, dalpha = 0,
+    lambda = 0 satisfies every constraint.
 
-    The direction of tau is kept exactly in every step, also while the
-    azimuths turn: the allocator then delivers a smaller lambda in the right
-    direction instead of a force pointing the wrong way. When the solution
-    stops changing (du = 0, dalpha = 0) it is a solution of the steady-state
-    problem above.
+    Differences from the paper:
+      - lambda (Part 1 rule) instead of the slack s^T Q s, so the direction of
+        tau is kept exactly when the demand is infeasible
+      - power W_i(u_i) = k |u_i|^(3/2) replaced by mu_u u_i^2
+      - no sector limits alpha_min, alpha_max (eq. 6), the azimuths turn freely
+      - no thrust-rate bound (also not in the paper), the thrust ramp is left
+        to the actuator model
 
-    mu_alpha [1/rad^2] costs rotation and breaks ties between solutions with
-    (almost) the same lambda. It also damps chattering at the capacity limit.
-    mu_u [1/kN^2] is a small thrust cost.
-
-    Not included from the survey (Fossen and Johansen, eq. 27): the slack s
-    (the direction is kept exactly instead) and the singularity term.
+    mu_alpha [1/rad^2] costs rotation per step, mu_u [1/kN^2] costs thrust,
+    rho and eps weight the singularity term.
     """
 
     def __init__(self, thrusters: List[ThrusterConfig], method: str = "steady_state",
-                 mu_alpha: float = 0.1, mu_u: float = 1e-6):
+                 mu_alpha: float = 0.1, mu_u: float = 1e-6, rho: float = 3e-4, eps: float = 1.0):
         self.thrusters = thrusters
         self.Be = build_Be(thrusters)  #Constant 3 x n_z effectiveness matrix, built by build_Be()
-        self.Be_pinv = np.linalg.pinv(self.Be)  # CHANGED: pseudo-inverse computed once, as in Part 1
+        self.Be_pinv = np.linalg.pinv(self.Be)
 
         # Choice of method
-        if method not in ("steady_state", "sequential"):
-            raise ValueError(f"unknown method {method!r}, use 'steady_state' or 'sequential'")
+        if method not in ("steady_state", "jfb"):  # CHANGED: "sequential" and "nonlinear" removed, "jfb" added
+            raise ValueError(f"unknown method {method!r}, use 'steady_state' or 'jfb'")
         self.method = method
 
-        # Weights for the sequential method
+        # Weights for the JFB method
+        # given in the constructor, with default values. This way we could span over possible values in the analysis script.
+
         self.mu_alpha = mu_alpha  # cost on the change in azimuth angle per step [1/rad^2]
         self.mu_u = mu_u  # small cost on thrust [1/kN^2]
+
+        # Singularity weight (JFB eq. 3). rho = 3e-4 keeps 60 kN sway away from +-90 deg
+        # (det 30 instead of 0) without losing capacity. rho >= 1e-3 blocks the azimuths
+        # at +-88 deg, and 400 kN sway then gives 61 kN instead of 95.4 kN.
+        self.rho = rho
+        self.eps = eps
+
+        # Linearisation point, the commands from the previous step (paper: previous optimal solution).
+        # None until the first call, then u_now / alpha_now are used.
+        self.u_prev = None
+        self.alpha_prev = None
 
 
     def allocate(
@@ -260,49 +289,69 @@ class ThrustAllocator:
     ) -> Tuple[np.ndarray, np.ndarray]:
 
         # Switch for the method
-        if self.method == "sequential":
-            return self.allocate_sequential(t, dt, tau_d, u_now, alpha_now)
+        if self.method == "jfb":
+            return self.allocate_jfb(t, dt, tau_d, u_now, alpha_now)
         return self.allocate_steady_state(t, dt, tau_d, u_now, alpha_now)
 
 
-    # PART 2: allocate_sequential method
-    def allocate_sequential(self, t, dt, tau_d, u_now, alpha_now):
+    # Part 2: allocate_jfb method
+    def allocate_jfb(self, t, dt, tau_d, u_now, alpha_now):
 
-        SCALE = 1000.0  # work in kN and kNm, same as in the steady-state SLSQP
+        SCALE = 1000.0  # kN and kNm, same as in the steady-state SLSQP
         thrusters = self.thrusters
         n = len(thrusters)
         az = [i for i, thr in enumerate(thrusters) if thr.kind == "azimuth"]
         n_az = len(az)
 
         tau = np.asarray(tau_d, dtype=float)[[0, 1, 5]] / SCALE
-        u0 = np.asarray(u_now, dtype=float) / SCALE
-        alpha0 = np.asarray(alpha_now, dtype=float)
 
-        # Step 1: linearised wrench around the current state.
-        # T(alpha0 + dalpha)(u0 + du) ~ T(alpha0)(u0 + du) + D dalpha
+        # Step 1: linearisation point (u0, alpha0) = previous commands.
+        # First call: start from the actual actuator state.
+       
+        if self.u_prev is None:
+            u0 = np.asarray(u_now, dtype=float) / SCALE
+            alpha0 = np.asarray(alpha_now, dtype=float).copy()
+        else:
+            u0 = self.u_prev
+            alpha0 = self.alpha_prev
+
+        # Step 2: linearised wrench around (u0, alpha0), paper eq. (9).
+        # B(alpha0 + dalpha)(u0 + du) ~ B(alpha0)(u0 + du) + D dalpha
         B = build_B(thrusters, alpha0)
         D = build_D(thrusters, alpha0, u0)
 
-        # Step 2: the optimisation variable x = [du (n), dalpha (n_az), lambda].
+        # Step 3: linearised singularity term, paper eq. (8): rho * dg/dalpha(alpha0) dalpha.
+        # The gradient is found numerically (central differences), as in the paper.
+        def g(alpha):
+            return 1.0 / (self.eps + singularity_measure(thrusters, alpha))
+
+        h = 1e-4  # [rad]
+        grad_g = np.zeros(n_az)
+        for j, i in enumerate(az):
+            a_plus, a_minus = alpha0.copy(), alpha0.copy()
+            a_plus[i] += h
+            a_minus[i] -= h
+            grad_g[j] = (g(a_plus) - g(a_minus)) / (2 * h)
+        c_sing = self.rho * grad_g  # linear cost on dalpha
+
+        # Step 4: the optimisation variable x = [du (n), dalpha (n_az), lambda].
         def objective(x):
             du, dalpha, lam = x[:n], x[n:n + n_az], x[-1]
-            return -lam + self.mu_alpha * np.sum(dalpha ** 2) + self.mu_u * np.sum((u0 + du) ** 2)
+            return (-lam + self.mu_u * np.sum((u0 + du) ** 2) + self.mu_alpha * np.sum(dalpha ** 2)
+                    + c_sing @ dalpha)
+
+        def objective_grad(x):
+            du, dalpha = x[:n], x[n:n + n_az]
+            return np.concatenate([2 * self.mu_u * (u0 + du), 2 * self.mu_alpha * dalpha + c_sing, [-1.0]])
 
         def equality(x):
             du, dalpha, lam = x[:n], x[n:n + n_az], x[-1]
             return B @ (u0 + du) + D @ dalpha - lam * tau  # same direction as tau, exactly
 
-        # Gradients. SLSQP gets stuck at lambda = 0 for large demands without them.
-        def objective_grad(x):
-            du, dalpha = x[:n], x[n:n + n_az]
-            return np.concatenate([2 * self.mu_u * (u0 + du), 2 * self.mu_alpha * dalpha, [-1.0]])
-
         def equality_jac(x):
             return np.hstack([B, D, -tau[:, None]])
 
-        # Step 3: bounds.
-        # du: total thrust within u_max (the tangent to the disc for an azimuth).
-        # dalpha: at most one step of rotation, so the tangent stays a good approximation.
+        # Step 5: bounds, paper eq. (10) and (12).
         u_max = np.array([thr.u_max for thr in thrusters]) / SCALE
         dalpha_max = np.array([thrusters[i].rot_speed * dt for i in az])
 
@@ -310,28 +359,36 @@ class ThrustAllocator:
         bounds += [(-dalpha_max[j], dalpha_max[j]) for j in range(n_az)]
         bounds += [(0.0, 1.0)]
 
-        # Step 4: solve, starting from "no change" (x = 0).
+        # Step 6: solve, starting from "no change" (x = 0).
         x0 = np.zeros(n + n_az + 1)
         res = minimize(objective, x0, jac=objective_grad, method="SLSQP", bounds=bounds,
                        constraints=[{"type": "eq", "fun": equality, "jac": equality_jac}],
                        options={"ftol": 1e-10, "maxiter": 200})
         x = res.x
 
-        # Step 5: check the solution, fall back to the steady-state method if it is not usable.
+        # Step 7: check the solution, fall back to the steady-state method if it is not usable.
         if not res.success or np.max(np.abs(equality(x))) > 1e-3:
-            print(f"t={t:.1f}: sequential allocation failed ({res.message}), using steady-state")
-            return self.allocate_steady_state(t, dt, tau_d, u_now, alpha_now)
+            print(f"t={t:.1f}: jfb allocation failed ({res.message}), using steady-state")
+            u_cmd, alpha_cmd = self.allocate_steady_state(t, dt, tau_d, u_now, alpha_now)
+            self.u_prev = u_cmd / SCALE
+            self.alpha_prev = np.asarray(alpha_cmd, dtype=float).copy()
+            return u_cmd, alpha_cmd
 
-        # Step 6: back to commands.
+        # Step 8: back to commands, and store them as the next linearisation point.
         # No minimal-rotation flip needed: u is signed and dalpha is at most one step.
-        u_cmd = (u0 + x[:n]) * SCALE
-        alpha_cmd = alpha0.copy()
+        u_new = u0 + x[:n]
+        alpha_new = alpha0.copy()
         for j, i in enumerate(az):
-            alpha_cmd[i] = alpha0[i] + x[n + j]
+            alpha_new[i] = alpha0[i] + x[n + j]
         for i, thr in enumerate(thrusters):
             if thr.kind == "tunnel":
-                alpha_cmd[i] = thr.alpha0
+                alpha_new[i] = thr.alpha0
 
+        self.u_prev = u_new
+        self.alpha_prev = alpha_new  # kept unwrapped, only dalpha is used
+
+        u_cmd = u_new * SCALE
+        alpha_cmd = np.array([wrap_angle_pi(a) for a in alpha_new])  # wrap_angle_pi takes one angle
         return u_cmd, alpha_cmd
 
 

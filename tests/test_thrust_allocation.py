@@ -5,7 +5,7 @@ Each helper function is tested on its own with small hand-checkable cases,
 then ThrustAllocator is tested end to end with ideal actuators.
 
 Run all:              python -m pytest tests/test_thrust_allocation.py -v
-Run one test:         python -m pytest tests/test_thrust_allocation.py -v -k sequential
+Run one test:         python -m pytest tests/test_thrust_allocation.py -v -k jfb
 
 Tests for functions that are not written yet are skipped automatically until
 the function exists.
@@ -185,7 +185,7 @@ def test_allocator_infeasible_400kN_reaches_full_capacity(thrusters):
 
 
 # -----------------------------------------------------------------------------
-# NEW: build_B, build_D and the sequential method
+# build_B, build_D and singularity_measure (used by the JFB method)
 # -----------------------------------------------------------------------------
 
 def test_build_B_matches_build_Be_columns(thrusters, Be):
@@ -209,31 +209,63 @@ def test_build_D_matches_finite_difference(thrusters):
         assert np.allclose(D[:, j], fd, atol=1e-4)
 
 
-def run_sequential(thrusters, tau_d, T=30.0, dynamics=False):
-    """Call the sequential allocator repeatedly and feed the actuator state back."""
-    alloc = ta.ThrustAllocator(thrusters, method="sequential")
+@pytest.mark.parametrize("deg1, deg2, expected", [(0, 0, 36.0), (90, 90, 0.0), (90, -90, 0.0), (90, 0, 625.0)])
+def test_singularity_measure_hand_values(thrusters, deg1, deg2, expected):
+    # det(B B^T) = det(B)^2 for 3 thrusters. Both azimuths at +-90 deg: no thruster gives surge.
+    alpha = np.array([np.pi / 2, np.radians(deg1), np.radians(deg2)])
+    assert np.isclose(ta.singularity_measure(thrusters, alpha), expected, atol=1e-6)
+
+
+# -----------------------------------------------------------------------------
+# JFB method (Johansen, Fossen and Berge 2004)
+# -----------------------------------------------------------------------------
+
+def run_jfb(thrusters, tau_d, T=30.0, dynamics=False, **kwargs):
+    """Call the JFB allocator repeatedly and feed the actuator state back.
+    Returns the last wrench, whether every command was within u_max, the largest change
+    in commanded azimuth angle per step [rad] and the final actual angles."""
+    alloc = ta.ThrustAllocator(thrusters, method="jfb", **kwargs)
     ts = ThrusterSet(thrusters, dynamics=dynamics)
     u_max = np.array([th.u_max for th in thrusters])
     within = True
+    max_dalpha = 0.0
+    a_prev = None
     for k in range(int(round(T / 0.1))):
         u, a = alloc.allocate(k * 0.1, 0.1, tau_d, ts.get_thrusts(), ts.get_angles())
         within = within and bool(np.all(np.abs(u) <= u_max + 1.0))
+        if a_prev is not None:
+            d = np.arctan2(np.sin(a[1:] - a_prev[1:]), np.cos(a[1:] - a_prev[1:]))
+            max_dalpha = max(max_dalpha, float(np.max(np.abs(d))))
+        a_prev = a
         _, _, tau = ts.step(u, a, 0.1)
-    return tau, within
+    return tau, within, max_dalpha, ts.get_angles()
+
+
+def test_jfb_unknown_method_raises(thrusters):
+    with pytest.raises(ValueError):
+        ta.ThrustAllocator(thrusters, method="sequential")
 
 
 @pytest.mark.parametrize("label, tau_d", FEASIBLE_CASES)
-def test_sequential_reproduces_feasible_wrench(thrusters, label, tau_d):
+def test_jfb_reproduces_feasible_wrench(thrusters, label, tau_d):
+    # Same as the course check: repeated calls from the initial state, ideal actuators, 30 s
     tau_d = np.array(tau_d, dtype=float)
-    tau, within = run_sequential(thrusters, tau_d)
+    tau, within, _, _ = run_jfb(thrusters, tau_d)
     assert within, label
     assert np.allclose(tau, tau_d[[0, 1, 5]], atol=500.0), label
 
 
+def test_jfb_rotation_per_step_within_rate_limit(thrusters):
+    # Paper eq. (12): |dalpha| <= rot_speed * dt in every step
+    rot_step = max(th.rot_speed for th in thrusters) * 0.1
+    _, _, max_dalpha, _ = run_jfb(thrusters, np.array([0.0, 60e3, 0, 0, 0, 0]), T=30.0)
+    assert max_dalpha <= rot_step + 1e-9
+
+
 @pytest.mark.parametrize("tau_d", [[0, 400e3, 0, 0, 0, 0], [200e3, 200e3, 0, 0, 0, 0], [0, 0, 0, 0, 0, 3000e3]])
-def test_sequential_infeasible_keeps_direction_and_limits(thrusters, tau_d):
+def test_jfb_infeasible_keeps_direction_and_limits(thrusters, tau_d):
     tau_d = np.array(tau_d, dtype=float)
-    tau, within = run_sequential(thrusters, tau_d, T=60.0, dynamics=True)
+    tau, within, _, _ = run_jfb(thrusters, tau_d, T=60.0, dynamics=True)
     assert within
     d = tau_d[[0, 1, 5]] / np.linalg.norm(tau_d[[0, 1, 5]])
     along = tau @ d
@@ -241,6 +273,25 @@ def test_sequential_infeasible_keeps_direction_and_limits(thrusters, tau_d):
     assert np.linalg.norm(tau - along * d) < 0.01 * along     # direction kept within 1 %
 
 
-def test_sequential_400kN_reaches_full_capacity(thrusters):
-    tau, _ = run_sequential(thrusters, np.array([0.0, 400e3, 0, 0, 0, 0]), T=60.0, dynamics=True)
+def test_jfb_400kN_reaches_full_capacity(thrusters):
+    tau, _, _, _ = run_jfb(thrusters, np.array([0.0, 400e3, 0, 0, 0, 0]), T=60.0, dynamics=True)
     assert tau[1] > 90e3                                       # optimum is about 95.4 kN
+
+
+def test_jfb_singularity_term_keeps_azimuths_away_from_90deg(thrusters):
+    # Steady 60 kN sway: without the term the azimuths end at +-91 deg (det ~ 0),
+    # with the default rho = 3e-4 at about +-84 deg
+    tau_d = np.array([0.0, 60e3, 0, 0, 0, 0])
+    _, _, _, a0 = run_jfb(thrusters, tau_d, T=60.0, rho=0.0)
+    _, _, _, a1 = run_jfb(thrusters, tau_d, T=60.0)
+    assert ta.singularity_measure(thrusters, a0) < 5.0
+    assert ta.singularity_measure(thrusters, a1) > 10.0
+
+
+def test_jfb_new_instance_has_no_memory(thrusters):
+    # The linearisation point is stored in the allocator. A new instance starts from u_now / alpha_now.
+    alloc = ta.ThrustAllocator(thrusters, method="jfb")
+    assert alloc.u_prev is None and alloc.alpha_prev is None
+    alloc.allocate(0.0, 0.1, np.array([20e3, 0, 0, 0, 0, 0]), np.zeros(3), np.array([np.pi / 2, 0.0, 0.0]))
+    assert alloc.u_prev is not None
+    assert ta.ThrustAllocator(thrusters, method="jfb").u_prev is None
