@@ -50,7 +50,7 @@ class ReferenceModel:
     ):
         self.dt = float(dt)
         self.cfg_xy = cfg_xy if cfg_xy is not None else RefAxisConfig()
-        self.cfg_psi = cfg_psi if cfg_psi is not None else RefAxisConfig(wn=0.08)
+        self.cfg_psi = cfg_psi if cfg_psi is not None else RefAxisConfig(wn=0.06)
         self.eta_ref = np.zeros(6)
         self.nu_ref = np.zeros(6)
         self.acc_ref = np.zeros(6)

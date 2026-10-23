@@ -32,7 +32,7 @@ class RefAxisConfig:
     defaults here (overriding them only in ``run_case_part_2.py`` will not
     reach the checks).
     """
-    wn: float = 0.15                    # natural frequency [rad/s]
+    wn: float = 0.04                    # natural frequency [rad/s]
     zeta: float = 1.0                   # damping ratio [-]
     rate_limit: Optional[float] = None  # max |x_dot| (m/s or rad/s); None = off
 
