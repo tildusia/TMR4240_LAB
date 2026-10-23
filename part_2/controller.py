@@ -63,12 +63,12 @@ class DPController:
     """
 
     def __init__(self, *args, **kwargs):
-        names = ("Kp", "Ki", "Kd", "Kaw", "use_feedforward")
+        names = ("Kp", "Ki", "Kd", "tau_cap", "use_feedforward")
         defaults = {
             "Kp": np.array([24_028.00, 28_268.00, 545_600.00]),
             "Ki": np.array([480.56, 565.36, 5_456.00]),
             "Kd": np.array([240_280.00, 282_680.00, 10_912_000.00]),
-            "Kaw": np.array([0.2, 0.2, 0.2]),
+            "tau_cap": np.array([160_000.0, 190_000.0, 860_000.0]),
             "use_feedforward": True,
         }
         if len(args) > len(names):
@@ -83,7 +83,7 @@ class DPController:
         self.Kp = np.asarray(defaults["Kp"], dtype=float)
         self.Ki = np.asarray(defaults["Ki"], dtype=float)
         self.Kd = np.asarray(defaults["Kd"], dtype=float)
-        self.Kaw = np.asarray(defaults["Kaw"], dtype=float)
+        self.tau_cap = np.asarray(defaults["tau_cap"], dtype=float)
         self.use_feedforward = bool(defaults["use_feedforward"])
         self.int_ned = np.zeros(2)
         self.int_psi = 0.0
@@ -117,6 +117,7 @@ class DPController:
         e_psi = wrap_angle_pi(eta_ref[5] - psi)
         e_body_xy = ned_to_body_xy(e_ned, psi)
 
+        int_ned_prev, int_psi_prev = self.int_ned.copy(), self.int_psi 
         self.int_ned += e_ned * dt
         self.int_psi += e_psi * dt
         int_body_xy = ned_to_body_xy(self.int_ned, psi)
@@ -139,15 +140,14 @@ class DPController:
         tau_d[0], tau_d[1] = p_xy + i_xy + d_xy
         tau_d[5] = p_psi + i_psi + d_psi
         self._tau_unsat = tau_d.copy()
+        saturated = np.abs(tau_d[[0, 1, 5]]) > self.tau_cap
+        if saturated[0] or saturated[1]:
+            self.int_ned = int_ned_prev
+        if saturated[2]:
+            self.int_psi = int_psi_prev
         self.last_pid_body = {
             "P": np.array([p_xy[0], p_xy[1], 0, 0, 0, p_psi]),
             "I": np.array([i_xy[0], i_xy[1], 0, 0, 0, i_psi]),
             "D": np.array([d_xy[0], d_xy[1], 0, 0, 0, d_psi]),
         }
         return tau_d
-
-    def apply_external_aw(self, tau_applied: np.ndarray, psi: float, dt: float) -> None:
-        tau_applied = np.asarray(tau_applied, dtype=float).reshape(6)
-        diff_xy_ned = body_to_ned_xy(tau_applied[:2] - self._tau_unsat[:2], psi)
-        self.int_ned += self.Kaw[:2] * diff_xy_ned * dt / self.Ki[:2]
-        self.int_psi += self.Kaw[2] * (tau_applied[5] - self._tau_unsat[5]) * dt / self.Ki[2]
