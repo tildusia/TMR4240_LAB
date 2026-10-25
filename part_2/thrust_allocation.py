@@ -195,24 +195,13 @@ def singularity_measure(thrusters: List[ThrusterConfig], alpha: np.ndarray) -> f
 class ThrustAllocator:
     """Thrust allocator with two methods, chosen with ``method``.
 
-    The checks build ThrustAllocator(thrusters), so the default method is the
-    one the checks see.
+    The checks build ThrustAllocator(thrusters), so the default method
+    ("jfb") is the one the checks see. ThrustAllocator(thrusters,
+    method="steady_state") gives the Part 1 allocator.
 
-    STEADY-STATE METHOD (method = "steady_state", the Part 1 allocator)
+    JFB METHOD (method = "jfb", DEFAULT, Part 2 continuation of Part 1)
     -------------------------------------------------------------------
-    Regime 1 (feasible demand): pseudo-inverse z = Be^+ tau.
-    Regime 2 (infeasible demand): SLSQP on the augmented vector [z, lambda],
-        max lambda
-        s.t. Be z = lambda tau,  |z_i| <= u_max,i,  0 <= lambda <= 1.
-    This delivers the largest possible fraction lambda of the requested
-    wrench in the requested direction. Starts from the regime 1 solution
-    scaled to the limit, and falls back to that scaled solution if SLSQP fails.
-    z_to_commands picks the (u, alpha) or (-u, alpha + pi) with the smaller
-    rotation from alpha_now.
-
-    JFB METHOD (method = "jfb", Part 2 continuation of Part 1)
-    -----------------------------------------------------------
-    NEW: the quasi-dynamic allocation of Johansen, Fossen and Berge (2004),
+    The quasi-dynamic allocation of Johansen, Fossen and Berge (2004),
     with the Part 1 rule for saturation (largest lambda, direction kept)
     instead of the slack s. Nonlinear program, paper eq. (3)-(7):
 
@@ -236,7 +225,8 @@ class ThrustAllocator:
 
     D = d(B(alpha) u)/d alpha at (u0, alpha0). The problem is convex (a QP)
     and solved with SLSQP. It is always feasible: du = -u0, dalpha = 0,
-    lambda = 0 satisfies every constraint.
+    lambda = 0 satisfies every constraint. If SLSQP still fails, the step
+    falls back to the steady-state method.
 
     Differences from the paper:
       - lambda (Part 1 rule) instead of the slack s^T Q s, so the direction of
@@ -248,17 +238,29 @@ class ThrustAllocator:
 
     mu_alpha [1/rad^2] costs rotation per step, mu_u [1/kN^2] costs thrust,
     rho and eps weight the singularity term.
+
+    STEADY-STATE METHOD (method = "steady_state", the Part 1 allocator)
+    -------------------------------------------------------------------
+    Regime 1 (feasible demand): pseudo-inverse z = Be^+ tau.
+    Regime 2 (infeasible demand): SLSQP on the augmented vector [z, lambda],
+        max lambda
+        s.t. Be z = lambda tau,  |z_i| <= u_max,i,  0 <= lambda <= 1.
+    This delivers the largest possible fraction lambda of the requested
+    wrench in the requested direction. Starts from the regime 1 solution
+    scaled to the limit, and falls back to that scaled solution if SLSQP fails.
+    z_to_commands picks the (u, alpha) or (-u, alpha + pi) with the smaller
+    rotation from alpha_now.
     """
 
-    def __init__(self, thrusters: List[ThrusterConfig], method: str = "steady_state",
+    def __init__(self, thrusters: List[ThrusterConfig], method: str = "jfb",  
                  mu_alpha: float = 0.1, mu_u: float = 1e-6, rho: float = 3e-4, eps: float = 1.0):
         self.thrusters = thrusters
         self.Be = build_Be(thrusters)  #Constant 3 x n_z effectiveness matrix, built by build_Be()
         self.Be_pinv = np.linalg.pinv(self.Be)
 
         # Choice of method
-        if method not in ("steady_state", "jfb"):  # CHANGED: "sequential" and "nonlinear" removed, "jfb" added
-            raise ValueError(f"unknown method {method!r}, use 'steady_state' or 'jfb'")
+        if method not in ("steady_state", "jfb"):
+            raise ValueError(f"unknown method {method!r}, use 'jfb' or 'steady_state'")
         self.method = method
 
         # Weights for the JFB method
@@ -307,10 +309,18 @@ class ThrustAllocator:
 
         # Step 1: linearisation point (u0, alpha0) = previous commands.
         # First call: start from the actual actuator state.
+        # CHANGED: if no actuator state is given (allocate called without u_now/alpha_now),
+        # start from zero thrust and the default angles alpha0.
        
         if self.u_prev is None:
-            u0 = np.asarray(u_now, dtype=float) / SCALE
-            alpha0 = np.asarray(alpha_now, dtype=float).copy()
+            if u_now is not None:
+                u0 = np.asarray(u_now, dtype=float) / SCALE
+            else:
+                u0 = np.zeros(n)
+            if alpha_now is not None:
+                alpha0 = np.asarray(alpha_now, dtype=float).copy()
+            else:
+                alpha0 = np.array([thr.alpha0 for thr in thrusters], dtype=float)
         else:
             u0 = self.u_prev
             alpha0 = self.alpha_prev
@@ -411,7 +421,7 @@ class ThrustAllocator:
 
             def objective(z_bar):
                 lam = z_bar[-1]  # Retrieves the lambda variable, can not use 1/lambda because of possible divison by 0
-                return -lam  # CHANGED: maximize lambda only (the mu * z^T P z tie-breaker is removed)
+                return -lam  # maximize lambda only (the mu * z^T P z tie-breaker is removed)
 
             def equality(z_bar):
                 lam = z_bar[-1]

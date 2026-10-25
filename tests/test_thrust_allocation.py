@@ -2,13 +2,14 @@
 Unit tests for part_2/thrust_allocation.py
 
 Each helper function is tested on its own with small hand-checkable cases,
-then ThrustAllocator is tested end to end with ideal actuators.
+then both allocation methods are tested end to end with ideal actuators:
+
+    method="jfb"           (default) Johansen, Fossen and Berge (2004),
+                           tested over repeated calls, as the course check does
+    method="steady_state"  Part 1 allocator, tested on a single call
 
 Run all:              python -m pytest tests/test_thrust_allocation.py -v
-Run one test:         python -m pytest tests/test_thrust_allocation.py -v -k jfb
-
-Tests for functions that are not written yet are skipped automatically until
-the function exists.
+Run one group:        python -m pytest tests/test_thrust_allocation.py -v -k jfb
 """
 import numpy as np
 import pytest
@@ -32,18 +33,33 @@ def Be(thrusters):
     return ta.build_Be(thrusters)
 
 
-def needs(name):
-    """Skip a test if the function is not implemented yet."""
-    if not hasattr(ta, name):
-        pytest.skip(f"{name} not implemented yet")
-    return getattr(ta, name)
-
-
 def wrench_from_commands(thrusters, u_cmd, alpha_cmd):
     """Body wrench [Fx, Fy, Mz] that the commands give with ideal actuators."""
     ts = ThrusterSet(thrusters, dynamics=False)
     _, _, tau = ts.step(u_cmd, alpha_cmd, 0.1)
     return tau
+
+
+# Start state used in the single-call tests: tunnel at its fixed angle, azimuths at 0 rad
+ALPHA_START = np.array([np.pi / 2, 0.0, 0.0])
+
+
+# -----------------------------------------------------------------------------
+# Method choice
+# -----------------------------------------------------------------------------
+
+def test_default_method_is_jfb(thrusters):
+    # The course check builds ThrustAllocator(thrusters), so this is the method it sees
+    assert ta.ThrustAllocator(thrusters).method == "jfb"
+
+
+def test_steady_state_can_be_chosen(thrusters):
+    assert ta.ThrustAllocator(thrusters, method="steady_state").method == "steady_state"
+
+
+def test_unknown_method_raises(thrusters):
+    with pytest.raises(ValueError):
+        ta.ThrustAllocator(thrusters, method="sequential")
 
 
 # -----------------------------------------------------------------------------
@@ -80,7 +96,7 @@ def test_max_ratio(thrusters):
 
 
 # -----------------------------------------------------------------------------
-# z_to_commands
+# z_to_commands (used by the steady-state method)
 # -----------------------------------------------------------------------------
 
 def test_z_to_commands_tunnel_and_polar_conversion(thrusters):
@@ -143,55 +159,13 @@ def test_minimal_rotation_never_turns_more_than_90deg(thrusters):
 
 
 # -----------------------------------------------------------------------------
-# ThrustAllocator end to end (ideal actuators)
-# -----------------------------------------------------------------------------
-
-FEASIBLE_CASES = [
-    ("pure surge 20 kN", [20e3, 0, 0, 0, 0, 0]),
-    ("pure sway 20 kN", [0, 20e3, 0, 0, 0, 0]),
-    ("pure yaw 200 kNm", [0, 0, 0, 0, 0, 200e3]),
-    ("combined", [10e3, 10e3, 0, 0, 0, 100e3]),
-    ("sway 70 kN (pinv saturates, SLSQP needed)", [0, 70e3, 0, 0, 0, 0]),
-]
-
-
-@pytest.mark.parametrize("label, tau_d", FEASIBLE_CASES)
-def test_allocator_reproduces_feasible_wrench(thrusters, label, tau_d):
-    tau_d = np.array(tau_d, dtype=float)
-    alloc = ta.ThrustAllocator(thrusters)
-    u, a = alloc.allocate(0.0, 0.1, tau_d, np.zeros(3), np.array([np.pi / 2, 0.0, 0.0]))
-    tau = wrench_from_commands(thrusters, u, a)
-    assert np.allclose(tau, tau_d[[0, 1, 5]], atol=1.0), label
-
-
-@pytest.mark.parametrize("F", [100e3, 200e3, 400e3])
-def test_allocator_infeasible_respects_limits_and_direction(thrusters, F):
-    tau_d = np.array([0.0, F, 0.0, 0.0, 0.0, 0.0])
-    alloc = ta.ThrustAllocator(thrusters)
-    u, a = alloc.allocate(0.0, 0.1, tau_d, np.zeros(3), np.array([np.pi / 2, 0.0, 0.0]))
-    u_max = np.array([th.u_max for th in thrusters])
-    assert np.all(np.abs(u) <= u_max + 1.0)                     # course check limit
-    tau = wrench_from_commands(thrusters, u, a)
-    assert abs(tau[0]) < 1.0 and abs(tau[2]) < 1.0              # direction kept: pure sway
-    assert tau[1] > 0
-
-
-@pytest.mark.xfail(reason="known issue: steady-state SLSQP stays near its start guess for very large demands")
-def test_allocator_infeasible_400kN_reaches_full_capacity(thrusters):
-    tau_d = np.array([0.0, 400e3, 0.0, 0.0, 0.0, 0.0])
-    u, a = ta.ThrustAllocator(thrusters).allocate(
-        0.0, 0.1, tau_d, np.zeros(3), np.array([np.pi / 2, 0.0, 0.0]))
-    assert wrench_from_commands(thrusters, u, a)[1] > 90e3      # optimum is about 95.4 kN
-
-
-# -----------------------------------------------------------------------------
 # build_B, build_D and singularity_measure (used by the JFB method)
 # -----------------------------------------------------------------------------
 
 def test_build_B_matches_build_Be_columns(thrusters, Be):
     # With all azimuths at 0 rad, the azimuth columns of T(alpha) equal the Fx columns of Be,
     # and the tunnel column is the same in both.
-    B = ta.build_B(thrusters, np.array([np.pi / 2, 0.0, 0.0]))
+    B = ta.build_B(thrusters, ALPHA_START)
     assert np.allclose(B[:, 0], Be[:, 0])
     assert np.allclose(B[:, 1], Be[:, 1])
     assert np.allclose(B[:, 2], Be[:, 3])
@@ -217,7 +191,20 @@ def test_singularity_measure_hand_values(thrusters, deg1, deg2, expected):
 
 
 # -----------------------------------------------------------------------------
-# JFB method (Johansen, Fossen and Berge 2004)
+# Shared test cases
+# -----------------------------------------------------------------------------
+
+FEASIBLE_CASES = [
+    ("pure surge 20 kN", [20e3, 0, 0, 0, 0, 0]),
+    ("pure sway 20 kN", [0, 20e3, 0, 0, 0, 0]),
+    ("pure yaw 200 kNm", [0, 0, 0, 0, 0, 200e3]),
+    ("combined", [10e3, 10e3, 0, 0, 0, 100e3]),
+    ("sway 70 kN (pinv saturates, SLSQP needed)", [0, 70e3, 0, 0, 0, 0]),
+]
+
+
+# -----------------------------------------------------------------------------
+# JFB method (default), repeated calls with the actuator state fed back
 # -----------------------------------------------------------------------------
 
 def run_jfb(thrusters, tau_d, T=30.0, dynamics=False, **kwargs):
@@ -239,11 +226,6 @@ def run_jfb(thrusters, tau_d, T=30.0, dynamics=False, **kwargs):
         a_prev = a
         _, _, tau = ts.step(u, a, 0.1)
     return tau, within, max_dalpha, ts.get_angles()
-
-
-def test_jfb_unknown_method_raises(thrusters):
-    with pytest.raises(ValueError):
-        ta.ThrustAllocator(thrusters, method="sequential")
 
 
 @pytest.mark.parametrize("label, tau_d", FEASIBLE_CASES)
@@ -292,6 +274,50 @@ def test_jfb_new_instance_has_no_memory(thrusters):
     # The linearisation point is stored in the allocator. A new instance starts from u_now / alpha_now.
     alloc = ta.ThrustAllocator(thrusters, method="jfb")
     assert alloc.u_prev is None and alloc.alpha_prev is None
-    alloc.allocate(0.0, 0.1, np.array([20e3, 0, 0, 0, 0, 0]), np.zeros(3), np.array([np.pi / 2, 0.0, 0.0]))
+    alloc.allocate(0.0, 0.1, np.array([20e3, 0, 0, 0, 0, 0]), np.zeros(3), ALPHA_START)
     assert alloc.u_prev is not None
     assert ta.ThrustAllocator(thrusters, method="jfb").u_prev is None
+
+
+def test_jfb_first_call_without_actuator_state(thrusters):
+    # Without u_now / alpha_now the first call starts from zero thrust and the default angles alpha0
+    alloc = ta.ThrustAllocator(thrusters, method="jfb")
+    u, a = alloc.allocate(0.0, 0.1, np.array([20e3, 0, 0, 0, 0, 0]))
+    u_max = np.array([th.u_max for th in thrusters])
+    assert np.all(np.abs(u) <= u_max + 1.0)
+    rot_step = max(th.rot_speed for th in thrusters) * 0.1
+    alpha0 = np.array([th.alpha0 for th in thrusters])
+    assert np.all(np.abs(a[1:] - alpha0[1:]) <= rot_step + 1e-9)   # one step away from alpha0 at most
+
+
+# -----------------------------------------------------------------------------
+# Steady-state method (method="steady_state"), single call
+# -----------------------------------------------------------------------------
+
+@pytest.mark.parametrize("label, tau_d", FEASIBLE_CASES)
+def test_steady_state_reproduces_feasible_wrench(thrusters, label, tau_d):
+    tau_d = np.array(tau_d, dtype=float)
+    alloc = ta.ThrustAllocator(thrusters, method="steady_state")
+    u, a = alloc.allocate(0.0, 0.1, tau_d, np.zeros(3), ALPHA_START)
+    tau = wrench_from_commands(thrusters, u, a)
+    assert np.allclose(tau, tau_d[[0, 1, 5]], atol=1.0), label
+
+
+@pytest.mark.parametrize("F", [100e3, 200e3, 400e3])
+def test_steady_state_infeasible_respects_limits_and_direction(thrusters, F):
+    tau_d = np.array([0.0, F, 0.0, 0.0, 0.0, 0.0])
+    alloc = ta.ThrustAllocator(thrusters, method="steady_state")
+    u, a = alloc.allocate(0.0, 0.1, tau_d, np.zeros(3), ALPHA_START)
+    u_max = np.array([th.u_max for th in thrusters])
+    assert np.all(np.abs(u) <= u_max + 1.0)                     # course check limit
+    tau = wrench_from_commands(thrusters, u, a)
+    assert abs(tau[0]) < 1.0 and abs(tau[2]) < 1.0              # direction kept: pure sway
+    assert tau[1] > 0
+
+
+@pytest.mark.xfail(reason="known issue: steady-state SLSQP stays near its start guess for very large demands")
+def test_steady_state_400kN_reaches_full_capacity(thrusters):
+    tau_d = np.array([0.0, 400e3, 0.0, 0.0, 0.0, 0.0])
+    u, a = ta.ThrustAllocator(thrusters, method="steady_state").allocate(
+        0.0, 0.1, tau_d, np.zeros(3), ALPHA_START)
+    assert wrench_from_commands(thrusters, u, a)[1] > 90e3      # optimum is about 95.4 kN
