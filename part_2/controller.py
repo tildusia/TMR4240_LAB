@@ -68,7 +68,7 @@ class DPController:
             "Kp": np.array([24_028.00, 28_268.00, 545_600.00]),
             "Ki": np.array([480.56, 565.36, 5_456.00]),
             "Kd": np.array([240_280.00, 282_680.00, 10_912_000.00]),
-            "tau_cap": np.array([160_000.0, 190_000.0, 860_000.0]),
+            "tau_cap": np.array([160_000.0, 95_400.0, 1_270_000.0]),
             "use_feedforward": True,
         }
         if len(args) > len(names):
