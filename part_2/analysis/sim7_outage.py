@@ -1,11 +1,12 @@
 """Simulation 7: station keeping through a loss of the position reference.
 
-Hypothesis: the Kalman observer's model (vessel dynamics + estimated bias)
-lets the DP system keep station through a GNSS/gyro outage by dead reckoning,
-so the excursion stays inside the 5 m DP watch circle for outages up to some
-tens of seconds, and then grows super-linearly because the slowly varying wind
-and gusts are not modelled.  Naively freezing the last measurement is much
-worse, because the observer then "sees" a vessel that is perfectly on target.
+Hypothesis: the nonlinear passive observer's model (vessel dynamics + estimated
+bias) lets the DP system keep station through a GNSS/gyro outage by dead
+reckoning, so the excursion stays inside the 5 m DP watch circle for outages up
+to some tens of seconds, and then grows super-linearly because the slowly
+varying wind and gusts are not modelled.  Naively freezing the last measurement
+is much worse, because the observer then "sees" a vessel that is perfectly on
+target.
 
     python -m part_2.analysis.sim7_outage
 """
@@ -19,8 +20,9 @@ import numpy as np
 import run_case_part_2 as rc
 from part_2.config import Part2SimConfig
 from part_2.analysis.sim6_robustness import moving_avg, wrap
-from part_2.observer import KalmanFilterObserver
+from part_2.observer import NonlinearPassiveObserver, ObserverEstimate
 from simulation.capability import low_frequency_motion
+from simulation.utils import Rz, to_3dof, to_6dof, wrap_angle_pi
 
 T_START = 300.0                         # outage begins after the filter has settled
 T_AFTER = 200.0                         # time kept after the outage ends
@@ -29,20 +31,18 @@ SEEDS = [123, 124, 125]
 MODES = ("dead_reckoning", "frozen")
 POS_LIMIT = rc.CAP_POS_LIMIT            # DP watch circle [m]
 PSI_LIMIT = rc.CAP_PSI_LIMIT_DEG        # [deg]
-R_OFF = 1e12                            # measurement covariance used to switch off the update
 
 
-class OutageKalman(KalmanFilterObserver):
-    """Kalman observer whose measurement is lost in [t0, t1).
+class OutageNPO(NonlinearPassiveObserver):
+    """Nonlinear passive observer whose measurement is lost in [t0, t1).
 
-    dead_reckoning: measurement update disabled (prediction only).
+    dead_reckoning: the correction terms are switched off (model prediction only).
     frozen: the last valid measurement is repeated and still trusted.
     """
 
     def __init__(self, t0, t1, mode, **kw):
         super().__init__(**kw)
         self.t0, self.t1, self.mode = t0, t1, mode
-        self._R_on = self.R.copy()
         self._held = None
 
     def step(self, t, dt, eta_measured, tau_est):
@@ -52,16 +52,28 @@ class OutageKalman(KalmanFilterObserver):
             self._held = z.copy()
         if lost and self.mode == "frozen":
             z = self._held
-        off = lost and self.mode == "dead_reckoning"
-        self.R = np.diag(np.full(3, R_OFF)) if off else self._R_on
-        return super().step(t, dt, z, tau_est)
+        if not (lost and self.mode == "dead_reckoning"):
+            return super().step(t, dt, z, tau_est)
+
+        h = float(dt)
+        tau = to_3dof(tau_est)
+        R = Rz(self.eta[2])
+        xi_dot = self.xi @ self.Aw.T
+        nu_dot = self.Minv @ (-self.D @ self.nu + R.T @ self.b + tau)
+        self.xi = self.xi + h * xi_dot
+        self.eta = self.eta + h * (R @ self.nu)
+        self.b = self.b - h * self.b / self.T_b
+        self.nu = self.nu + h * nu_dot
+        self.eta[2] = wrap_angle_pi(self.eta[2])
+        return ObserverEstimate(eta=to_6dof(self.eta), nu=to_6dof(self.nu), bias=to_6dof(self.b))
 
 
 def run_case(duration, mode, seed):
     t1 = T_START + duration
-    cfg = Part2SimConfig(dt=rc.DT, T=t1 + T_AFTER, use_observer=True, observer_type="kalman")
+    cfg = Part2SimConfig(dt=rc.DT, T=t1 + T_AFTER, use_observer=True,
+                         observer_type=rc.selected_observer())
     sim = rc.make_sim(cfg)
-    sim.observer = OutageKalman(T_START, t1, mode)
+    sim.observer = OutageNPO(T_START, t1, mode)
     sim.reset_state()
     return sim.run(np.zeros(6), **dict(zip(("current", "wind", "waves"),
                                            rc.environment(seed=seed))))
@@ -115,7 +127,7 @@ def main():
                   + f"{worst[(m, d)]:15.2f}")
 
     col = {"dead_reckoning": "C0", "frozen": "C3"}
-    lab = {"dead_reckoning": "Kalman dead reckoning", "frozen": "frozen measurement"}
+    lab = {"dead_reckoning": "NPO dead reckoning", "frozen": "frozen measurement"}
 
     # Figure 1: time series for the 120 s outage
     fig, ax = plt.subplots(2, 1, figsize=(10, 6), sharex=True)

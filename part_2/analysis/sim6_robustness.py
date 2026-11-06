@@ -173,6 +173,23 @@ def main():
     fig.tight_layout()
     fig.savefig("results/p2sim6_fig3.png", dpi=300, bbox_inches="tight")
 
+    # Ideal-actuator control runs: the controller wrench is applied exactly
+    # (no allocation, limits, rate limits or azimuth dynamics), same seed/observer.
+    print("\nIDEAL ACTUATORS (bypass_actuators=True), window metrics")
+    ideal = {}
+    for k, (hs, tp) in SEAS.items():
+        cfg = Part2SimConfig(dt=rc.DT, T=T_RUN, use_observer=True, bypass_actuators=True,
+                             observer_type=rc.selected_observer())
+        ideal[k] = metrics(rc.run(cfg, np.zeros(6), rc.environment(hs=hs, tp=tp)),
+                           thrusters, t0, t1)
+    show = ("pos_tot_rms", "pos_tot_max", "psi_tot_rms", "psi_tot_max", "pos_lf_rms",
+            "pos_lf_max", "psi_lf_rms", "psi_lf_max", "est_N_lf_rms", "est_E_lf_rms",
+            "est_psi_lf_rms", "est_psi_lf_max")
+    print(f"{'metric':24s}{'design':>12s}{'heavy':>12s}   (real actuators: design, heavy)")
+    for key in show:
+        print(f"{key:24s}{ideal['design'][key]:12.3f}{ideal['heavy'][key]:12.3f}   "
+              f"{results[('design', 'window')][key]:10.3f}{results[('heavy', 'window')][key]:10.3f}")
+
 
 if __name__ == "__main__":
     main()
